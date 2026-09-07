@@ -51,7 +51,16 @@ endif ()
 # SokuLib
 add_subdirectory(SokuLib)
 
+# The relay builds either way: against SFML when it is installed, otherwise
+# against the small socket shim in src/Server/MiniNet.hpp. Requiring SFML to
+# build a UDP reflector turns "host your own server" into a toolchain project.
 if (SFML_FOUND)
+	message(STATUS "2v2Server: using SFML")
+else ()
+	message(STATUS "2v2Server: SFML not found, using bundled MiniNet shim")
+endif ()
+
+if (TRUE)
 	if (ASAN)
 		if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 			add_compile_options(/fsanitize=address)
@@ -71,11 +80,19 @@ if (SFML_FOUND)
 		src/Common/CustomPackets.cpp
 		SokuLib/src/Packet.cpp
 	)
-	target_include_directories(2v2Server PRIVATE SokuLib/src ${SFML_INCLUDE_DIRS} src/Common)
+	target_include_directories(2v2Server PRIVATE SokuLib/src src/Common)
 	target_compile_definitions(2v2Server PRIVATE CURL_STATICLIB $<$<CONFIG:Debug>:_DEBUG> SOKULIB_NO_MOD)
-	if (WIN32)
-		target_link_libraries(2v2Server ${SFML_NETWORK_LIBRARY} ${SFML_SYSTEM_LIBRARY} ws2_32)
-	else()
-		target_link_libraries(2v2Server ${SFML_NETWORK_LIBRARY} ${SFML_SYSTEM_LIBRARY})
-	endif()
+	if (SFML_FOUND)
+		target_include_directories(2v2Server PRIVATE ${SFML_INCLUDE_DIRS})
+		if (WIN32)
+			target_link_libraries(2v2Server ${SFML_NETWORK_LIBRARY} ${SFML_SYSTEM_LIBRARY} ws2_32)
+		else()
+			target_link_libraries(2v2Server ${SFML_NETWORK_LIBRARY} ${SFML_SYSTEM_LIBRARY})
+		endif()
+	else ()
+		target_compile_definitions(2v2Server PRIVATE USE_MININET)
+		if (WIN32)
+			target_link_libraries(2v2Server ws2_32)
+		endif()
+	endif ()
 endif ()

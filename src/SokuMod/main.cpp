@@ -314,6 +314,20 @@ static int extraNetProfileNamesTextures[2];
 static char extraOnlineNames[2][32];
 static bool characterSelectLocked = false;
 static char mySlot = -1;
+
+// Which of the four seats this client occupies, for other mods -- giuroll needs
+// it to route each peer's inputs to the right player.
+//
+// The server assigns it (PacketPlayerJoinAck) and nothing else can work it out:
+// a rollback netcode that guesses which slot it is puts every remote player in
+// control of the wrong character. Exported rather than published at a fixed
+// address because this DLL's base moves between launches.
+//
+// Returns -1 when no slot is held: not in a 4P session, or not yet joined.
+extern "C" __declspec(dllexport) int FourPSokuLocalSlot()
+{
+	return mySlot;
+}
 static char remoteMySlot = -1;
 static char selectedSlot = -1;
 static bool slotsTaken[4] = {false, false, false, false};
@@ -323,6 +337,94 @@ static SokuLib::DrawUtils::Sprite chooseBoxWaitText;
 static SokuLib::KeymapManager extraOnlineInputs[2] = {{(void *)0x85844C, {}, {}, {}, {}, true}, {(void *)0x85844C, {}, {}, {}, {}, true}};
 static std::deque<unsigned short> extraOnlineInputsBuffer[2];
 static std::vector<std::array<SokuLib::Inputs, 4>> replayInputs;
+
+// --- 4P replay sidecar -----------------------------------------------------
+//
+// Soku's own .rep holds two inputs per frame and nothing here changes that: a
+// 4P replay stays a VALID 2P replay that plays P1/P2 correctly in every
+// existing tool. P3/P4 ride alongside in a sidecar file.
+//
+// WHY A SIDECAR RATHER THAN A WIDER .rep. Extending the real format means
+// reverse-engineering the writer (SokuLib does not wrap it -- only
+// readReplay is exposed) and then breaking every replay tool in the ecosystem.
+// The sidecar costs one file and keeps both properties.
+//
+// WHY THIS EXISTS AT ALL, given replays were deferred: giuroll's rollback
+// verifier (check mode / PERFORMANCE_TEST) only runs on replays -- in local
+// versus giuroll's per-frame dispatch falls through to a no-op and no
+// savestate machinery runs at all. Replays are the only existing driver for
+// forcing a rollback, so proving the savestate covers P3/P4 needs them.
+static SokuLib::KeymapManager replayExtraInputs[2] = {{(void *)0x85844C, {}, {}, {}, {}, true}, {(void *)0x85844C, {}, {}, {}, {}, true}};
+static std::vector<std::array<unsigned short, 2>> sidecarInputs;
+static size_t sidecarCursor = 0;
+static bool sidecarLoaded = false;
+
+// KeyInput's ten signed frames-held counters -> the packed 12-bit Inputs the
+// replay/netplay path moves around.
+//
+// Read from the CharacterManager (keyMap, +0x754) rather than from
+// KeymapManager::inKeys, because inKeys is only populated when readInKeys is
+// set -- true for netplay and replay, FALSE for the local versus match we are
+// recording. keyMap is the input the engine actually applied, either way.
+//
+// The bit order is not guessed: it is the same mapping giuroll's get_input()
+// uses against the same offset, and it matches BattleKeys field order.
+static unsigned short packKeyInput(const SokuLib::KeyInput &k)
+{
+	SokuLib::Inputs out;
+
+	out.raw = 0;
+	out.battle.up    = k.verticalAxis   < 0;
+	out.battle.down  = k.verticalAxis   > 0;
+	out.battle.left  = k.horizontalAxis < 0;
+	out.battle.right = k.horizontalAxis > 0;
+	out.battle.A     = k.a > 0;
+	out.battle.B     = k.b > 0;
+	out.battle.C     = k.c > 0;
+	out.battle.dash  = k.d > 0;
+	out.battle.AandB = k.changeCard > 0;
+	out.battle.BandC = k.spellcard  > 0;
+	return out.raw;
+}
+
+// One fixed path, deliberately, for now: this exists to drive giuroll's
+// rollback verifier over the most recent 2v2, not to ship replays to players.
+// Pairing a sidecar with an arbitrary .rep needs the game's replay-SAVE
+// address, which SokuLib does not expose; that is worth finding when 4P
+// replays become a user-facing feature, and is dead weight before then.
+#define SIDECAR_PATH "replay/last4p.dat"
+
+static void sidecarSave()
+{
+	if (sidecarInputs.empty())
+		return;
+
+	std::ofstream s{SIDECAR_PATH, std::ios::binary};
+
+	if (!s)
+		return;
+	s.write(reinterpret_cast<const char *>(sidecarInputs.data()), sidecarInputs.size() * sizeof(sidecarInputs[0]));
+	printf("4PSoku: wrote %zu frames of P3/P4 input to " SIDECAR_PATH "\n", sidecarInputs.size());
+}
+
+static void sidecarLoad()
+{
+	std::ifstream s{SIDECAR_PATH, std::ios::binary};
+
+	sidecarInputs.clear();
+	sidecarCursor = 0;
+	if (!s) {
+		printf("4PSoku: no " SIDECAR_PATH "; P3/P4 will stand still in this replay.\n");
+		return;
+	}
+
+	std::array<unsigned short, 2> e;
+
+	while (s.read(reinterpret_cast<char *>(&e), sizeof(e)))
+		sidecarInputs.push_back(e);
+	printf("4PSoku: loaded %zu frames of P3/P4 input\n", sidecarInputs.size());
+}
+
 unsigned displayInputs = 0;
 static SokuLib::DrawUtils::Sprite inputsSheet;
 static SokuLib::DrawUtils::Sprite numbersSheet;
@@ -388,7 +490,23 @@ static std::map<unsigned char, unsigned> nbSkills{
 	{ SokuLib::CHARACTER_SUWAKO, 12 }
 };
 
-static std::pair<SokuLib::KeymapManager, SokuLib::KeymapManager> keymaps;
+// The vtable is set HERE and not only in loadExtraPlayerInputs' VSPLAYER
+// branch, because `keys` below points at these two from static init and the
+// engine can dereference them before that branch has ever run.
+//
+// It calls keymapManager->vtable[1] at 0x46C8FB with no null check:
+//     mov edi, [eax]      ; KeyManager -> keymapManager
+//     mov eax, [edi]      ; keymapManager -> vtable
+//     mov edx, [eax + 4]  ; vtable[1]   <-- faults when vtable is null
+// Default construction left the vtable null, so anything reaching the input
+// copy before the first VSPLAYER frame crashed reading 0x00000004. That was
+// latent: the VSPLAYER branch used to run during the menus and quietly fix it
+// up before any replay started. Adding a replay branch that takes precedence
+// exposed it, so the ordering dependency is removed rather than reordered.
+static std::pair<SokuLib::KeymapManager, SokuLib::KeymapManager> keymaps{
+	{(void *)0x85844C, {}, {}, {}, {}, false},
+	{(void *)0x85844C, {}, {}, {}, {}, false}
+};
 static std::pair<SokuLib::KeyManager, SokuLib::KeyManager> keys{{&keymaps.first}, {&keymaps.second}};
 static std::pair<SokuLib::PlayerInfo, SokuLib::PlayerInfo> assists = {
 	SokuLib::PlayerInfo{SokuLib::CHARACTER_CIRNO, 0, 0, 0, 0, {}, &keys.first},
@@ -707,6 +825,32 @@ static void drawPlayerBoxes(const SokuLib::CharacterManager &manager, bool playe
 	}
 }
 
+// The "dead" profile-name cheat, and why it must not run in netplay.
+//
+// profiles[] is this machine's OWN profile1/profile2/profile3p/profile4p, read
+// straight off disk at startup, and nothing syncs it. In a 4P session all four
+// machines evaluate this against four different sets of strings and agree only
+// because everyone happens to answer no. One player with a profile named "dead"
+// makes their machine kill that seat every frame while nobody else does.
+//
+// Under rollback that is worse than a desync, it is an unrecoverable one: each
+// machine re-simulates the corrected frames using its own answer, so the
+// correction never converges. It would present as an unexplainable divergence
+// rather than as a cheat somebody switched on.
+//
+// Replays keep the cheat, deliberately: a replay carries the mainMode of the
+// match it recorded, so a local match played with it on still plays back with
+// it on, and a netplay replay still plays back with it off.
+static bool deadProfileCheat(int player)
+{
+	if (
+		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ||
+		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSCLIENT
+	)
+		return false;
+	return strcmp(profiles[player]->name, "dead") == 0;
+}
+
 static void checkHealing(int i, int &healing)
 {
 	auto hp1 = dataMgr->players[i]->objectBase.hp;
@@ -721,7 +865,7 @@ static void checkHealing(int i, int &healing)
 		auto diffY = pos1.y - pos2.y;
 		auto &hud = hp1 == 0 ? *(CInfoManager *)0x8985E8 : hud2;
 
-		if (diffX * diffX + diffY * diffY <= HEAL_RADIUS * HEAL_RADIUS && strcmp(profiles[i + (hp2 == 0 ? 2 : 0)]->name, "dead"))
+		if (diffX * diffX + diffY * diffY <= HEAL_RADIUS * HEAL_RADIUS && !deadProfileCheat(i + (hp2 == 0 ? 2 : 0)))
 			healing++;
 		(&hud.p1State)[i].lastHp = healing * dead2->MaxHP / HEALING_TIME;
 		dead2->redHP = (&hud.p1State)[i].lastHp;
@@ -768,6 +912,18 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 		SokuLib::DeleteFct(*(void **)(*(int *)SokuLib::ADDR_GAME_DATA_MANAGER + 0x40));
 		*(void **)(*(int *)SokuLib::ADDR_GAME_DATA_MANAGER + 0x40) = alloc;
 		*(void **)(*(int *)SokuLib::ADDR_GAME_DATA_MANAGER + 0x44) = &alloc[4];
+		// activePlayers is a three-pointer vector: begin, last, end-of-storage.
+		// Only the first two were being updated, so +0x48 kept pointing into
+		// the allocation just freed on the line above -- a dangling capacity.
+		//
+		// Normal play never notices, because the game walks begin..last. Any
+		// consumer that reads CAPACITY does: giuroll's savestate does exactly
+		// that (read_vec at gameDataManager+0x40, then read_addr(start,
+		// end - start)) and dies with "size too big 410296" -- a byte count
+		// computed from the stale pointer minus the new allocation.
+		//
+		// We allocate exactly 4 and never grow, so end-of-storage == last.
+		*(void **)(*(int *)SokuLib::ADDR_GAME_DATA_MANAGER + 0x48) = &alloc[4];
 
 		dataMgr->players[2]->objectBase.opponent = &This->rightCharacterManager;
 		dataMgr->players[3]->objectBase.opponent = &This->leftCharacterManager;
@@ -775,6 +931,54 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 			dataMgr->players[i]->objectBase.offset_0x14E[0] = i;
 		init = true;
 	}
+
+	// 4P replay sidecar, stepped once per battle frame.
+	//
+	// ORDERING MATTERS AND IS THE EASY THING TO GET WRONG. On playback,
+	// loadExtraPlayerInputs has already published sidecarInputs[sidecarCursor]
+	// into replayExtraInputs for THIS frame, so the cursor is advanced here,
+	// after the frame has consumed it. On recording, keyMap holds the input the
+	// engine just applied to this frame, so appending here captures frame N's
+	// input at frame N. The two stay in phase only because both happen at the
+	// same point in the frame -- moving either one is a silent one-frame skew,
+	// which looks like a desync rather than like a bug.
+	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
+		if (!sidecarLoaded) {
+			sidecarLoad();
+			sidecarLoaded = true;
+		}
+		sidecarCursor++;
+	} else {
+		if (sidecarLoaded) {
+			// Left a replay; the next recording starts clean.
+			sidecarInputs.clear();
+			sidecarCursor = 0;
+			sidecarLoaded = false;
+		}
+		// Record LOCAL versus only, for two separate reasons.
+		//
+		// Rollback re-runs this function for every frame it re-simulates, so a
+		// push_back here would append the same frame once per rollback: the
+		// recording would be neither one-entry-per-frame nor in order, and it
+		// would grow at whatever rate the connection happens to mispredict.
+		//
+		// And the sidecar exists to drive giuroll's verifier over a 2v2. A
+		// local match does that. Having four machines each write their own copy
+		// of the same live match buys nothing and costs a disk write every five
+		// seconds during the one activity most sensitive to a frame spike.
+		if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSPLAYER) {
+			sidecarInputs.push_back({
+				packKeyInput(dataMgr->players[2]->keyMap),
+				packKeyInput(dataMgr->players[3]->keyMap)
+			});
+			// Flushed periodically rather than at match end: the replay-save
+			// site is not hooked, and a crash or an alt-F4 mid-match would
+			// otherwise lose the recording we were about to verify against.
+			if (sidecarInputs.size() % 300 == 0)
+				sidecarSave();
+		}
+	}
+
 	for (auto &player : dataMgr->players)
 		if (player->keyMap.pause == 1)
 			return (This->*s_originalBattleMgrOnProcess)();
@@ -783,7 +987,7 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 
 	for (int i = 0; i < 4; i++) {
 		hps[i] = dataMgr->players[i]->objectBase.hp;
-		if (strcmp(profiles[i]->name, "dead") != 0)
+		if (!deadProfileCheat(i))
 			continue;
 		if (dataMgr->players[i]->objectBase.hp > 0) {
 			dataMgr->players[i]->objectBase.hp = 0;
@@ -1606,8 +1810,32 @@ void __fastcall updateCollisionBoxes(SokuLib::BattleManager *This)
 		players[i]->additionalSpeed.x = speeds[i];
 }
 
+// Where the loading THREAD got to, written to a file.
+//
+// This hook is the one part of this mod that runs on the game's asset worker
+// (the thread at 0x43e5e0), and so it is the one part that can hang the game
+// with nothing else noticing. The netplay loading scene, CLoadingCL at
+// 0x4286d0, does nothing but poll *(0x89868c), which that worker clears when it
+// finishes; if this call never returns, the screen stays black for ever. By
+// then the relay's state machine has already reached FIGHT and is satisfied,
+// and every giuroll hook lives inside a battle scene that never starts, so no
+// other component has anything to say about it.
+//
+// A file rather than stdout: giuroll owns the console and fills it with
+// per-frame warnings, so these lines scroll away exactly when they matter.
+static void loadLog(const char *what)
+{
+	static bool started = false;
+	std::ofstream s{"4psoku-load.log", started ? std::ios::app : std::ios::trunc};
+
+	started = true;
+	if (s)
+		s << what << std::endl;
+}
+
 void __stdcall loadDeckData(char *charName, void *csvFile, SokuLib::DeckInfo &deck, int param4, SokuLib::Dequeue<short> &newDeck)
 {
+	loadLog("loadDeckData: entered");
 	if (!spawned || init) {
 		if (spawned)
 			init = false;
@@ -1617,14 +1845,20 @@ void __stdcall loadDeckData(char *charName, void *csvFile, SokuLib::DeckInfo &de
 
 		puts("Not spawned. Loading both assisters");
 		puts("Loading character 1");
+		loadLog("loadDeckData: constructing P3");
 		((void (__thiscall *)(GameDataManager*, int, SokuLib::PlayerInfo &))0x46da40)(dataMgr, 2, assists.first);
+		loadLog("loadDeckData: P3 constructed, calling its loader");
 		(*(void (__thiscall **)(SokuLib::CharacterManager *))(*(int *)dataMgr->players[2] + 0x44))(dataMgr->players[2]);
 		players[2] = dataMgr->players[2];
+		loadLog("loadDeckData: P3 done");
 
 		puts("Loading character 2");
+		loadLog("loadDeckData: constructing P4");
 		((void (__thiscall *)(GameDataManager*, int, SokuLib::PlayerInfo &))0x46da40)(dataMgr, 3, assists.second);
+		loadLog("loadDeckData: P4 constructed, calling its loader");
 		(*(void (__thiscall **)(SokuLib::CharacterManager *))(*(int *)dataMgr->players[3] + 0x44))(dataMgr->players[3]);
 		players[3] = dataMgr->players[3];
+		loadLog("loadDeckData: P4 done");
 
 		init = false;
 		printf("%p %p\n", dataMgr->players[2], dataMgr->players[3]);
@@ -1632,9 +1866,13 @@ void __stdcall loadDeckData(char *charName, void *csvFile, SokuLib::DeckInfo &de
 		//if (hudInit)
 		//	((void (__thiscall *)(CInfoManager *, bool))*hud2.vtable)(&hud2, 0);
 		hudInit = true;
+		loadLog("loadDeckData: initHud");
 		initHud();
+		loadLog("loadDeckData: assisters ready");
 	}
+	loadLog("loadDeckData: calling the original");
 	s_origLoadDeckData(charName, csvFile, deck, param4, newDeck);
+	loadLog("loadDeckData: returned");
 }
 
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16])
@@ -1655,7 +1893,27 @@ int loadExtraPlayerInputs()
 {
 	int g = og_FUN4098D6();
 
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSPLAYER) {
+	// Replay FIRST, and that ordering is the actual bug fix.
+	//
+	// A replay of a local match keeps mainMode == VSPLAYER and only flips
+	// subMode to REPLAY, so the VSPLAYER branch below used to fire during
+	// playback and bind P3/P4 to whoever was holding a controller. The two
+	// extra players were being driven live while P1/P2 replayed -- which is
+	// why 4P replays never worked, and why they failed by diverging rather
+	// than by crashing.
+	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
+		if (sidecarCursor < sidecarInputs.size()) {
+			replayExtraInputs[0].inKeys.raw = sidecarInputs[sidecarCursor][0];
+			replayExtraInputs[1].inKeys.raw = sidecarInputs[sidecarCursor][1];
+		} else {
+			// Ran past the sidecar: hold neutral rather than repeat the last
+			// input forever, which would look like a stuck stick.
+			replayExtraInputs[0].inKeys.raw = 0;
+			replayExtraInputs[1].inKeys.raw = 0;
+		}
+		keys.first.keymapManager = &replayExtraInputs[0];
+		keys.second.keymapManager = &replayExtraInputs[1];
+	} else if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSPLAYER) {
 		auto key = &keymaps.first;
 
 		for (int i = 0; i < 2; i++) {
@@ -3938,10 +4196,23 @@ void __fastcall updateExtraInputHandlers(void *This)
 	auto &netObj = SokuLib::getNetObject();
 
 	fct(This);
-	extraOnlineInputs[0].inKeys.raw = extraOnlineInputsBuffer[0].front();
-	extraOnlineInputsBuffer[0].pop_front();
-	extraOnlineInputs[1].inKeys.raw = extraOnlineInputsBuffer[1].front();
-	extraOnlineInputsBuffer[1].pop_front();
+	// front() on an empty deque is unchecked here -- it dereferences begin()
+	// and hands back whatever is at that address.
+	//
+	// The pushes come from pushOnlineInputs, four per received frame, and they
+	// are not guaranteed to keep up with the pops any more. The relay reflects
+	// each sender's own datagram now instead of emitting one 4-wide array, and
+	// giuroll's canned startup packets declare fewer inputs than one 4P frame
+	// needs, which yields zero pushes while this still pops once per frame.
+	//
+	// Hold the previous input when the queue is dry: a repeated frame is a
+	// visible stutter that recovers on the next packet, a garbage read is not.
+	for (int i = 0; i < 2; i++) {
+		if (extraOnlineInputsBuffer[i].empty())
+			continue;
+		extraOnlineInputs[i].inKeys.raw = extraOnlineInputsBuffer[i].front();
+		extraOnlineInputsBuffer[i].pop_front();
+	}
 	replayInputs.push_back({
 		netObj.p1InputMgr.inKeys,
 		netObj.p2InputMgr.inKeys,
@@ -4094,6 +4365,8 @@ void parseExtraChrsGameMatch(SokuLib::PlayerMatchData *ptr)
 {
 	auto *infos = &assists.first;
 
+	loadLog("parseExtraChrsGameMatch: entered");
+
 	for (int j = 0; j < 2; j++) {
 		infos->character = static_cast<SokuLib::Character>(ptr->character);
 		infos->palette = ptr->skinId;
@@ -4104,6 +4377,7 @@ void parseExtraChrsGameMatch(SokuLib::PlayerMatchData *ptr)
 		ptr = (SokuLib::PlayerMatchData *)ptr->getEndPtr();
 		infos++;
 	}
+	loadLog("parseExtraChrsGameMatch: P3/P4 taken from the match packet");
 }
 
 void __declspec(naked) parseExtraChrsGameMatch_hook()

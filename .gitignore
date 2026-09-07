@@ -44,3 +44,5 @@ build
 *.pat
 *.dat
 src/assets/output
+build-server
+
