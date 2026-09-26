@@ -765,31 +765,25 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 		// is frame `frameId`, group 1 the frame before, and so on. Fewer groups
 		// than new frames and it drops the whole packet.
 		//
-		// This used to label every reply frameId = packet.frameId + 1, and fill
-		// every group with each player's LATEST input at the moment of asking.
-		// Two consequences, both seen live:
+		// Each group now carries each player's input FOR THAT FRAME. It used to
+		// carry each player's LATEST input at the moment of asking, which differs
+		// between clients asking about the same frame at different times, and
+		// became a placeholder the instant a player moved on to loading -- even
+		// for frames whose real input was buffered. Whoever reached the end of
+		// stage select last therefore simulated different frames and never
+		// finished: three players waiting at loading, one alone in stage select
+		// (2026-09-26).
 		//
-		//  - One new frame per reply, so a client could advance one frame per
-		//    round trip to the relay: character select ran at 1000/ping fps --
-		//    ~25 fps for a 40 ms player, ~10 for a slower one. That is the
-		//    "extremely laggy" character select, and the input delay setting
-		//    never had anything to do with it.
-		//  - "Latest at the moment of asking" differs between clients asking
-		//    about the same frame at different times, so they did not simulate
-		//    the same inputs. A one-frame confirm press could reach three
-		//    screens and miss the fourth. Worse, once a player left character
-		//    select every group for them became a placeholder -- even for
-		//    frames whose real input was sitting in the buffer -- so whoever
-		//    was last to reach the end of stage select was guaranteed to see
-		//    different frames and never finished: three players waiting at
-		//    loading, one alone in stage select. The freeze of 2026-09-26.
-		//
-		// Now each frame carries each player's input FOR THAT FRAME, which is
-		// identical whoever asks and whenever, and a reply carries as many new
-		// frames as the barrier allows (up to the packet limit), so a client
-		// can run ahead within the delay window instead of waiting one round
-		// trip per frame.
-		unsigned newest = std::min(lastFrame, packet.frameId + MAX_CHRSELECT_FRAMES_PER_PACKET);
+		// ONE new frame per reply, still, and deliberately. The game stamps its
+		// OUTGOING input with its last RECEIVED frame (netmanager+0x98 is both),
+		// and the acceptance loop above takes only the next consecutive frame.
+		// Handing a client eight frames at once made its stamps jump by eight,
+		// the relay never accepted another input from anyone, and all four
+		// stalled one second into character select (2026-09-26, the build right
+		// after this was written). So character select still advances one frame
+		// per round trip -- 1000/ping fps -- until the game's own send side is
+		// understood well enough to change both ends together.
+		unsigned newest = packet.frameId + 1;
 		unsigned groups = std::min<unsigned>(MAX_CHRSELECT_FRAMES_PER_PACKET, newest - client.state->frameIdOffset);
 
 		if (groups == 0)
