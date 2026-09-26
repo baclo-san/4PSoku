@@ -183,7 +183,16 @@ void Server::update()
 
 	while (true) {
 		for (auto &c : this->_clients) {
-			if (c.second.lastPacket.getElapsedTime().asSeconds() >= 10 || c.second.lastChainReceived.getElapsedTime().asSeconds() >= 5)
+			// The CHAIN deadline only for clients that are sent CHAIN, which is
+			// those past STATUS_POLITE. A client still in the handshake never
+			// gets one, so it used to be dropped five seconds after its first
+			// packet whatever it was doing -- and a game that had already said
+			// HELLO then retried INIT_REQUEST into a relay that no longer knew
+			// it. Silence for ten seconds is the rule for everyone.
+			if (
+				c.second.lastPacket.getElapsedTime().asSeconds() >= 10 ||
+				(c.second.status > STATUS_POLITE && c.second.lastChainReceived.getElapsedTime().asSeconds() >= 5)
+			)
 				this->_disconnect(c.second);
 			else if (c.second.lastChain.getElapsedTime().asSeconds() >= 1 && c.second.status > STATUS_POLITE) {
 				this->_send<SokuLib::PacketChain, SokuLib::PacketType, uint32_t>(c.second, SokuLib::CHAIN, this->_state.players.size());
@@ -330,6 +339,17 @@ void Server::_handlePacket(Client &client, SokuLib::PacketInitRequ &packet, size
 {
 	if (packetSize < sizeof(packet))
 		return;
+	// INIT_REQUEST without a HELLO first. The game sends HELLO only once per
+	// connection attempt and then retries INIT_REQUEST, so if this relay lost
+	// the socket in between -- restarted, or timed it out -- every retry was
+	// dropped here in silence and the player could never get in. Seen live
+	// 2026-09-26: an endless column of INIT_REQUEST and no reply. The game id
+	// check below is what actually guards the door; the HELLO adds nothing.
+	if (client.status == STATUS_CONNECTED) {
+		std::cout << client.ip.toString() << ":" << client.port
+			<< " sent INIT_REQUEST without HELLO (relay restarted or lost it) -- accepting" << std::endl;
+		client.status = STATUS_POLITE;
+	}
 	if (client.status < STATUS_POLITE)
 		return;
 	if (memcmp(packet.gameId, versionString2v2, 16) != 0) {
