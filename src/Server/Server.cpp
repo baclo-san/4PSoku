@@ -622,7 +622,17 @@ void Server::_handlePacketGame(Client &client, SokuLib::GameLoadedEvent &packet,
 			client.state->lastFrameId = characterInputDelay;
 			client.state->inputs.clear();
 			client.state->inputs.resize(characterInputDelay, {.raw = 0});
-		} else if (client.state->state == JOINING) {
+		} else if (
+			client.state->state == JOINING ||
+			// Everyone after the FIRST player back from a battle. The first
+			// one's report moves all four to END_OF_FIGHT, so the branch above
+			// no longer matches for the rest, and they used to get no answer
+			// at all -- a game that resends "loaded" until acknowledged sat on
+			// a black screen. Answering again is harmless: it is the same
+			// acknowledgement the first player got.
+			client.state->state == END_OF_FIGHT ||
+			client.state->state == SELECT_CHARACTER
+		) {
 			SokuLib::PacketGame game{SokuLib::HOST_GAME};
 
 			game.event.loaded = packet;
@@ -784,10 +794,23 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 		// per round trip -- 1000/ping fps -- until the game's own send side is
 		// understood well enough to change both ends together.
 		unsigned newest = packet.frameId + 1;
-		unsigned groups = std::min<unsigned>(MAX_CHRSELECT_FRAMES_PER_PACKET, newest - client.state->frameIdOffset);
 
-		if (groups == 0)
+		// newest can be the renumbering frame itself: renumbering sets
+		// frameIdOffset to the client's frame + 1, which is exactly the next
+		// frame it needs, and no player has input for it (the buffer starts
+		// one after). It gets neutral input below, identically for everyone.
+		//
+		// This used to be `newest - frameIdOffset` groups and a return on
+		// zero -- which is always zero for the first frame after coming back
+		// from a battle. No reply, so the client never advanced, so the next
+		// packet asked for the same frame: every player stuck at the delay
+		// window forever, the black screen after the first match
+		// (2026-09-27). The first character select only escaped it because
+		// its joining handshake echoes frames before the exchange starts.
+		if (newest < client.state->frameIdOffset)
 			return;
+
+		unsigned groups = std::min<unsigned>(MAX_CHRSELECT_FRAMES_PER_PACKET, newest - client.state->frameIdOffset + 1);
 		client.internalTimer++;
 		game->event.input.frameId = newest;
 		game->event.input.inputCount = groups * 4;
@@ -810,7 +833,12 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 				}
 				if (known)
 					out = p->getInput(pFrame);
-				else {
+				else if (p != nullptr && pFrame <= p->frameIdOffset) {
+					// Before this player's first input in this scene: the
+					// renumbering frame. Nothing pressed -- a placeholder
+					// confirm press here would be a real press to the game.
+					out.raw = 0;
+				} else {
 					// Beyond anything the player sent. Derived from the frame,
 					// not from a per-client timer, so every client still gets
 					// the same thing for the same frame.
