@@ -4506,6 +4506,35 @@ void __declspec(naked) parseExtraChrsGameMatch_hook()
 	}
 }
 
+// Player 2's deck, taken from the match packet instead of this machine's profile.
+//
+// The vanilla client's GAME_MATCH handler (0x455266) copies P1 -- the host,
+// the remote player in 1v1 -- from the packet, but rebuilds P2 from the LOCAL
+// profile with a call to 0x4356a0 at 0x4552E3: in 1v1 P2 is the client's own
+// player, so its own profile is where the deck lives. In 4P every machine is a
+// client of the relay and P2 is only local on ONE of them. Everyone else gave
+// P2 their own deck for that character, so each machine drew different cards
+// for P2 and the first card played desynced the match. Seen 2026-09-27: the
+// hand reports showed P2's first card as 13 on one machine, 200 on another and
+// 104 on the two where P2's own profile was used.
+//
+// Replaces that call. At the call site edi holds the parsed match (see the
+// parser at 0x454000: P1's deck at +0x10, P2's at +0x24), and the arguments
+// are (destination deque, character, deck id). 0x42dbb0 is the deque copy the
+// handler itself uses for P1. In 1v1 the packet's P2 is what this client sent,
+// so nothing changes there.
+void __declspec(naked) takeP2DeckFromMatch()
+{
+	__asm {
+		MOV ECX, [ESP + 4]
+		LEA EAX, [EDI + 0x24]
+		PUSH EAX
+		MOV EAX, 0x42DBB0
+		CALL EAX
+		RET 0xC
+	}
+}
+
 extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hParentModule)
 {
 	DWORD old;
@@ -4523,7 +4552,8 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		// Last byte bumped 0x96 -> 0x97 for the per-frame team logic: an older
 		// 4PSoku joining this relay would play, then desync at the first heal.
 		// The relay refuses a mismatch at the door and says why.
-		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x97
+		// 0x97 -> 0x98: P2's deck from the match packet (takeP2DeckFromMatch).
+		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x98
 	};
 
 	myModule = hMyModule;
@@ -4895,6 +4925,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 
 	new SokuLib::Trampoline(0x428789, sendCurrentSelectCharacter, 5);
 	SokuLib::TamperNearCall(0x45409A, parseExtraChrsGameMatch_hook);
+	SokuLib::TamperNearCall(0x4552E3, takeP2DeckFromMatch);
 	*(char *)0x45409F = 0x90;
 	og_FUNCALL43F996 = SokuLib::TamperNearJmpOpr(0x43F996, onInputsReset);
 

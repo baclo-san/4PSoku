@@ -54,7 +54,9 @@ const uint8_t versionString2v2[] = {
 	// Last byte bumped 0x96 -> 0x97 for the per-frame team logic: an older
 	// 4PSoku joining this relay would play, then desync at the first heal.
 	// The relay refuses a mismatch at the door and says why.
-	0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x97
+	// 0x97 -> 0x98: 4PSoku takes P2's deck from the match packet. An older one
+	// gives P2 its own profile's deck and desyncs at P2's first card.
+	0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x98
 };
 
 const char emptyMagicString[32] = "\0\x1F\x54\xF2\xA2\x67\x90\x78\xC2";
