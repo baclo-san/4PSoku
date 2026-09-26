@@ -192,7 +192,24 @@ public:
 		addr.sin_family = AF_INET;
 		addr.sin_port = htons(port);
 		addr.sin_addr.s_addr = address.toNetworkOrder();
-		return ::bind(_sock, (sockaddr *)&addr, sizeof(addr)) == 0 ? Done : Error;
+		if (::bind(_sock, (sockaddr *)&addr, sizeof(addr)) != 0)
+			return Error;
+#ifdef _WIN32
+		// Windows reports an ICMP "port unreachable" for an earlier send as a
+		// failure of the NEXT recvfrom on the same UDP socket. For a relay that
+		// is routine -- a player closes their game and the next packet to them
+		// bounces -- and it used to kill the whole relay with "Unknown socket
+		// error" for everyone else (2026-09-26). giuroll turns this off on the
+		// game's socket for the same reason. SIO_UDP_CONNRESET, from mstcpip.h.
+		{
+			const DWORD SIO_UDP_CONNRESET_ = 0x9800000C;
+			BOOL report = FALSE;
+			DWORD unused = 0;
+
+			WSAIoctl(_sock, SIO_UDP_CONNRESET_, &report, sizeof(report), nullptr, 0, &unused, nullptr, nullptr);
+		}
+#endif
+		return Done;
 	}
 
 	Status receive(void *data, std::size_t size, std::size_t &received,
@@ -211,7 +228,18 @@ public:
 #ifdef _WIN32
 			// No datagram waiting is the normal case on a non-blocking socket,
 			// not a failure -- the server polls this in a loop.
-			return WSAGetLastError() == WSAEWOULDBLOCK ? NotReady : Error;
+			switch (WSAGetLastError()) {
+			case WSAEWOULDBLOCK:
+				return NotReady;
+			// Per-datagram failures: a bounced earlier send, or a datagram
+			// larger than the buffer. The socket is fine and the next datagram
+			// is readable, so report "skip this one", not a dead socket.
+			case WSAECONNRESET:
+			case WSAEMSGSIZE:
+				return Partial;
+			default:
+				return Error;
+			}
 #else
 			return (errno == EAGAIN || errno == EWOULDBLOCK) ? NotReady : Error;
 #endif

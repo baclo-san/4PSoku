@@ -222,7 +222,18 @@ void Server::update()
 		case sf::Socket::NotReady:
 			return;
 		case sf::Socket::Error:
-			throw std::runtime_error("Unknown socket error");
+			// Never fatal. One player's broken path must not end everyone's
+			// session; say so (rate limited) and poll again next tick.
+			{
+				static auto lastReport = std::chrono::steady_clock::time_point{};
+				auto now = std::chrono::steady_clock::now();
+
+				if (now - lastReport > std::chrono::seconds(5)) {
+					lastReport = now;
+					std::cout << "socket receive error " << WSAGetLastError() << " -- ignored, relay keeps running" << std::endl;
+				}
+			}
+			return;
 		default:
 			break;
 		}
@@ -748,20 +759,70 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 		// so a gap of exactly 64 frames multiplies to 256 and truncates to
 		// zero -- a packet declaring no inputs, which the client rejects in the
 		// same way and never recovers from either.
-		unsigned sendUpTo = std::min(lastFrame, packet.frameId + MAX_CHRSELECT_FRAMES_PER_PACKET);
+		// What the game does with this packet (the distributor at 0x454D30):
+		// it takes frameId minus the last frame it received as the number of
+		// NEW frames, and reads them from the highest index down -- so group 0
+		// is frame `frameId`, group 1 the frame before, and so on. Fewer groups
+		// than new frames and it drops the whole packet.
+		//
+		// This used to label every reply frameId = packet.frameId + 1, and fill
+		// every group with each player's LATEST input at the moment of asking.
+		// Two consequences, both seen live:
+		//
+		//  - One new frame per reply, so a client could advance one frame per
+		//    round trip to the relay: character select ran at 1000/ping fps --
+		//    ~25 fps for a 40 ms player, ~10 for a slower one. That is the
+		//    "extremely laggy" character select, and the input delay setting
+		//    never had anything to do with it.
+		//  - "Latest at the moment of asking" differs between clients asking
+		//    about the same frame at different times, so they did not simulate
+		//    the same inputs. A one-frame confirm press could reach three
+		//    screens and miss the fourth. Worse, once a player left character
+		//    select every group for them became a placeholder -- even for
+		//    frames whose real input was sitting in the buffer -- so whoever
+		//    was last to reach the end of stage select was guaranteed to see
+		//    different frames and never finished: three players waiting at
+		//    loading, one alone in stage select. The freeze of 2026-09-26.
+		//
+		// Now each frame carries each player's input FOR THAT FRAME, which is
+		// identical whoever asks and whenever, and a reply carries as many new
+		// frames as the barrier allows (up to the packet limit), so a client
+		// can run ahead within the delay window instead of waiting one round
+		// trip per frame.
+		unsigned newest = std::min(lastFrame, packet.frameId + MAX_CHRSELECT_FRAMES_PER_PACKET);
+		unsigned groups = std::min<unsigned>(MAX_CHRSELECT_FRAMES_PER_PACKET, newest - client.state->frameIdOffset);
 
+		if (groups == 0)
+			return;
 		client.internalTimer++;
-		game->event.input.frameId = packet.frameId + 1;
-		game->event.input.inputCount = (sendUpTo - packet.frameId) * 4;
-		for (int i = 0; i < game->event.input.inputCount; i += 4) {
-			for (int j = 0; j < 4; j++) {
-				auto &p = *this->_state.slots[j];
+		game->event.input.frameId = newest;
+		game->event.input.inputCount = groups * 4;
+		for (unsigned g = 0; g < groups; g++) {
+			unsigned frame = newest - g;
 
-				if (p.state != SELECT_CHARACTER) {
-					game->event.input.inputs[game->event.input.inputCount - 4 - i + j].raw = 0;
-					game->event.input.inputs[game->event.input.inputCount - 4 - i + j].charSelect.Z = (client.internalTimer >> 2) & 1;
-				} else
-					game->event.input.inputs[game->event.input.inputCount - 4 - i + j] = p.getInput(lastFrame - client.state->frameIdOffset + p.frameIdOffset);
+			for (int j = 0; j < 4; j++) {
+				auto &out = game->event.input.inputs[g * 4 + j];
+				auto *p = this->_state.slots[j];
+				// Only character-select input, and only frames it covers. A
+				// player who has moved on to loading still HAS input for the
+				// frames the others have yet to simulate; those must be the
+				// real ones.
+				bool known = false;
+				unsigned pFrame = 0;
+
+				if (p != nullptr && (p->state == SELECT_CHARACTER || p->state == READY_TO_LOAD)) {
+					pFrame = frame - client.state->frameIdOffset + p->frameIdOffset;
+					known = pFrame > p->frameIdOffset && pFrame <= p->lastFrameId;
+				}
+				if (known)
+					out = p->getInput(pFrame);
+				else {
+					// Beyond anything the player sent. Derived from the frame,
+					// not from a per-client timer, so every client still gets
+					// the same thing for the same frame.
+					out.raw = 0;
+					out.charSelect.Z = (frame >> 2) & 1;
+				}
 			}
 		}
 	} else {
