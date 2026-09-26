@@ -29,6 +29,7 @@
 #include "Packet.hpp"
 
 extern const uint8_t versionString2v2[16];
+extern unsigned characterInputDelay;
 
 class Server {
 private:

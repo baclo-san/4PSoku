@@ -356,7 +356,38 @@ static std::vector<std::array<SokuLib::Inputs, 4>> replayInputs;
 // forcing a rollback, so proving the savestate covers P3/P4 needs them.
 static SokuLib::KeymapManager replayExtraInputs[2] = {{(void *)0x85844C, {}, {}, {}, {}, true}, {(void *)0x85844C, {}, {}, {}, {}, true}};
 static std::vector<std::array<unsigned short, 2>> sidecarInputs;
-static size_t sidecarCursor = 0;
+// Every piece of simulation state the mod keeps OUTSIDE the game's own objects.
+//
+// Rollback netplay works by saving the whole simulation, rewinding it and
+// re-running frames. giuroll's savestate knows the game's structures; it cannot
+// know about counters living in this DLL's data section, and anything it does
+// not save is not rewound -- so after a rollback such a counter is ahead of
+// where the re-simulated frame expects it, on that machine only. The healing
+// counter was exactly this: it revives a dead player at a fixed count, and the
+// count drifted by however many frames each machine happened to re-simulate.
+//
+// So all of it lives in this one block, exported below as FourPSokuRollbackState,
+// and giuroll saves and restores it with every frame. Anything that changes
+// what happens in a match and persists from one frame to the next belongs in
+// here. It must stay trivially copyable: it is saved with memcpy.
+struct RollbackState {
+	// Frames each team's dead player has spent being healed; revives at
+	// HEALING_TIME. Reset at match start and at every round change.
+	// Named first/second for the code that used to see a std::pair, which is
+	// not trivially copyable under MSVC.
+	struct { int first; int second; } healing{0, 0};
+	// Battle frames simulated this match. Indexes the replay sidecar, so a
+	// rewound replay reads the P3/P4 input of the frame it rewound to.
+	unsigned frame = 0;
+};
+static_assert(std::is_trivially_copyable_v<RollbackState>);
+static RollbackState rollbackState;
+
+extern "C" __declspec(dllexport) void *FourPSokuRollbackState(size_t *size)
+{
+	*size = sizeof(rollbackState);
+	return &rollbackState;
+}
 static bool sidecarLoaded = false;
 
 // KeyInput's ten signed frames-held counters -> the packed 12-bit Inputs the
@@ -412,7 +443,6 @@ static void sidecarLoad()
 	std::ifstream s{SIDECAR_PATH, std::ios::binary};
 
 	sidecarInputs.clear();
-	sidecarCursor = 0;
 	if (!s) {
 		printf("4PSoku: no " SIDECAR_PATH "; P3/P4 will stand still in this replay.\n");
 		return;
@@ -512,7 +542,6 @@ static std::pair<SokuLib::PlayerInfo, SokuLib::PlayerInfo> assists = {
 	SokuLib::PlayerInfo{SokuLib::CHARACTER_CIRNO, 0, 0, 0, 0, {}, &keys.first},
 	SokuLib::PlayerInfo{SokuLib::CHARACTER_MARISA, 1, 0, 0, 0, {}, &keys.second}
 };
-static std::pair<int, int> healing{-1, -1};
 
 void loadExtraDatFiles(const char *path)
 {
@@ -879,14 +908,54 @@ static void checkHealing(int i, int &healing)
 	}
 }
 
+// The mod's team logic is only rollback-safe if giuroll saves the block above.
+// A giuroll from before that plays a 2v2 normally and then desyncs at the first
+// heal, which nobody would trace back to a version. Checked at each online
+// match start, reported once per session, on a thread of its own: a modal box
+// on the game thread would freeze this player and stall the other three.
+static void warnIfGiurollTooOld()
+{
+	static bool warned = false;
+
+	if (warned)
+		return;
+	if (SokuLib::mainMode != SokuLib::BATTLE_MODE_VSSERVER && SokuLib::mainMode != SokuLib::BATTLE_MODE_VSCLIENT)
+		return;
+
+	HMODULE giuroll = GetModuleHandleA("giuroll.dll");
+
+	if (!giuroll || GetProcAddress(giuroll, "GiurollSavesFourPlayerState"))
+		return;
+	warned = true;
+	puts("4PSoku: giuroll.dll is too old for this 4PSoku -- 2v2 netplay will desync.");
+	CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+		MessageBoxA(
+			nullptr,
+			"Your giuroll.dll is older than this 4PSoku.\n\n"
+			"The match will play, but it will desync the first time a player is healed.\n"
+			"Update giuroll.dll from the same release page as 4PSoku.",
+			"4PSoku",
+			MB_ICONWARNING
+		);
+		return 0;
+	}, nullptr, 0, nullptr);
+}
+
+// Once per CALL -- that is, once per displayed frame. Only work that does not
+// change the outcome of the match belongs here: debug keys, one-time setup,
+// camera and HUD animation.
+//
+// This used to hold the team logic as well, and that was a desync. The engine
+// runs a variable number of simulated frames inside one call: vanilla uses it
+// for its speed modes, and rollback uses it to re-simulate -- after a rollback
+// of five frames a single call runs six. Team logic hooked here ran once for
+// all six on the machine that rolled back, and six times on a machine that did
+// not, so the two stopped agreeing on healing, time stops and KOs. It now runs
+// inside the frame loop instead; see onSimulatedFramePre/Post.
 int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 {
-	auto players = (SokuLib::CharacterManager**)((int)This + 0x0C);
-
 	if (This->matchState == -1)
 		return (This->*s_originalBattleMgrOnProcess)();
-	//if (players[0]->objectBase.hp == 0 && players[2]->objectBase.hp == 0 || players[1]->objectBase.hp == 0 && players[3]->objectBase.hp == 0)
-	//	return SokuLib::SCENE_SELECT;
 	if (SokuLib::mainMode != SokuLib::BATTLE_MODE_VSSERVER && SokuLib::mainMode != SokuLib::BATTLE_MODE_VSCLIENT) {
 		if (SokuLib::checkKeyOneshot(DIK_F4, false, false, false))
 			disp = !disp;
@@ -929,99 +998,35 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 		dataMgr->players[3]->objectBase.opponent = &This->leftCharacterManager;
 		for (int i = 0; i < 4; i++)
 			dataMgr->players[i]->objectBase.offset_0x14E[0] = i;
+		// A new match. Nothing may carry over from the previous one: a player
+		// who just launched the game and one who has played ten matches must
+		// start from identical state, or they are desynced before frame one.
+		rollbackState = RollbackState{};
+		warnIfGiurollTooOld();
+		if (SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY) {
+			sidecarSave();
+			sidecarInputs.clear();
+		}
 		init = true;
 	}
 
-	// 4P replay sidecar, stepped once per battle frame.
-	//
-	// ORDERING MATTERS AND IS THE EASY THING TO GET WRONG. On playback,
-	// loadExtraPlayerInputs has already published sidecarInputs[sidecarCursor]
-	// into replayExtraInputs for THIS frame, so the cursor is advanced here,
-	// after the frame has consumed it. On recording, keyMap holds the input the
-	// engine just applied to this frame, so appending here captures frame N's
-	// input at frame N. The two stay in phase only because both happen at the
-	// same point in the frame -- moving either one is a silent one-frame skew,
-	// which looks like a desync rather than like a bug.
 	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
 		if (!sidecarLoaded) {
 			sidecarLoad();
 			sidecarLoaded = true;
 		}
-		sidecarCursor++;
-	} else {
-		if (sidecarLoaded) {
-			// Left a replay; the next recording starts clean.
-			sidecarInputs.clear();
-			sidecarCursor = 0;
-			sidecarLoaded = false;
-		}
-		// Record LOCAL versus only, for two separate reasons.
-		//
-		// Rollback re-runs this function for every frame it re-simulates, so a
-		// push_back here would append the same frame once per rollback: the
-		// recording would be neither one-entry-per-frame nor in order, and it
-		// would grow at whatever rate the connection happens to mispredict.
-		//
-		// And the sidecar exists to drive giuroll's verifier over a 2v2. A
-		// local match does that. Having four machines each write their own copy
-		// of the same live match buys nothing and costs a disk write every five
-		// seconds during the one activity most sensitive to a frame spike.
-		if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSPLAYER) {
-			sidecarInputs.push_back({
-				packKeyInput(dataMgr->players[2]->keyMap),
-				packKeyInput(dataMgr->players[3]->keyMap)
-			});
-			// Flushed periodically rather than at match end: the replay-save
-			// site is not hooked, and a crash or an alt-F4 mid-match would
-			// otherwise lose the recording we were about to verify against.
-			if (sidecarInputs.size() % 300 == 0)
-				sidecarSave();
-		}
+	} else if (sidecarLoaded) {
+		// Left a replay; the next recording starts clean.
+		sidecarInputs.clear();
+		sidecarLoaded = false;
 	}
 
-	for (auto &player : dataMgr->players)
-		if (player->keyMap.pause == 1)
-			return (This->*s_originalBattleMgrOnProcess)();
-
-	unsigned short hps[4];
-
-	for (int i = 0; i < 4; i++) {
-		hps[i] = dataMgr->players[i]->objectBase.hp;
-		if (!deadProfileCheat(i))
-			continue;
-		if (dataMgr->players[i]->objectBase.hp > 0) {
-			dataMgr->players[i]->objectBase.hp = 0;
-			dataMgr->players[i]->objectBase.action = SokuLib::ACTION_KNOCKED_DOWN_STATIC;
-			dataMgr->players[i]->objectBase.animate();
-		}
-	}
-	checkHealing(0, healing.first);
-	checkHealing(1, healing.second);
-#if 0
-	if (revived) {
-		for (auto &player : dataMgr->players) {
-			FUN_00438ce0(player, 0x8B, player->objectBase.position.x, player->objectBase.position.y, 1, 1);
-			player->dropInvulTimeLeft = max(player->dropInvulTimeLeft, HEALING_INVUL);
-		}
-		revived = false;
-	}
-#endif
 	healingCircle[0].setRotation(fmod(healingCircle[0].getRotation() + 0.01, M_PI * 2));
 	healingCircle[1].setRotation(-healingCircle[0].getRotation());
 
 	int ret = (This->*s_originalBattleMgrOnProcess)();
 	int index = 0;
 
-	if (This->matchState == 2)
-		for (int i = 0; i < 4; i++) {
-			if (hps[i] != 0 && dataMgr->players[i]->objectBase.hp == 0) {
-				for (int j = (i & 1) ^ 1; j < 4; j += 2)
-					if (dataMgr->players[j]->objectBase.opponent == dataMgr->players[i])
-						dataMgr->players[j]->objectBase.opponent = dataMgr->players[i ^ 2];
-				SokuLib::playSEWaveBuffer(SokuLib::SFX_KNOCK_OUT);
-			}
-			hps[i] = dataMgr->players[i]->objectBase.hp;
-		}
 	if (This->matchState <= 2 || This->matchState == 4)
 		for (; index < 4; index++) {
 			SokuLib::camera.p1X = &dataMgr->players[index]->objectBase.position.x;
@@ -1043,6 +1048,64 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 		if (*SokuLib::camera.p2Y < dataMgr->players[index]->objectBase.position.y)
 			SokuLib::camera.p2Y = &dataMgr->players[index]->objectBase.position.y;
 	}
+	return ret;
+}
+
+// Scratch shared by the two halves of ONE simulated frame. Written by Pre and
+// read by Post of the same frame, never across frames, so it needs no saving:
+// giuroll takes its savestate before Pre runs.
+static unsigned short frameHps[4];
+static bool frameSkipped = false;
+
+// Before the engine simulates a frame.
+static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
+{
+	frameSkipped = This->matchState == -1;
+	for (auto &player : dataMgr->players)
+		if (!frameSkipped && player->keyMap.pause == 1)
+			frameSkipped = true;
+	if (frameSkipped)
+		return;
+
+	for (int i = 0; i < 4; i++) {
+		frameHps[i] = dataMgr->players[i]->objectBase.hp;
+		if (!deadProfileCheat(i))
+			continue;
+		if (dataMgr->players[i]->objectBase.hp > 0) {
+			dataMgr->players[i]->objectBase.hp = 0;
+			dataMgr->players[i]->objectBase.action = SokuLib::ACTION_KNOCKED_DOWN_STATIC;
+			dataMgr->players[i]->objectBase.animate();
+		}
+	}
+	checkHealing(0, rollbackState.healing.first);
+	checkHealing(1, rollbackState.healing.second);
+}
+
+// After the engine simulates a frame. Team logic: KOs, opponent switching, and
+// keeping each pair's shared state (time stop, knockdown, round, score) merged.
+//
+// Deliberately NOT skipped while a menu is open. The old code returned early
+// whenever menuManager was non-empty, and a menu is local: in netplay one
+// player pressing Esc does not pause anyone's simulation, so that player's
+// machine alone stopped merging the pairs' state -- a desync from a key nobody
+// would suspect. In local play the engine does not simulate while paused, so
+// this is simply not reached then.
+static void __fastcall onSimulatedFramePost(SokuLib::BattleManager *This)
+{
+	auto players = (SokuLib::CharacterManager**)((int)This + 0x0C);
+
+	if (frameSkipped)
+		return;
+
+	if (This->matchState == 2)
+		for (int i = 0; i < 4; i++) {
+			if (frameHps[i] != 0 && dataMgr->players[i]->objectBase.hp == 0) {
+				for (int j = (i & 1) ^ 1; j < 4; j += 2)
+					if (dataMgr->players[j]->objectBase.opponent == dataMgr->players[i])
+						dataMgr->players[j]->objectBase.opponent = dataMgr->players[i ^ 2];
+				SokuLib::playSEWaveBuffer(SokuLib::SFX_KNOCK_OUT);
+			}
+		}
 	for (int i = 0; i < 4; i++) {
 		if (dataMgr->players[i]->keyManager->keymapManager->input.select == 1) {
 			int j = (i % 2) ^ 1;
@@ -1052,8 +1115,6 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 			dataMgr->players[i]->objectBase.opponent = dataMgr->players[j];
 		}
 	}
-	if (!SokuLib::menuManager.empty() && SokuLib::sceneId == SokuLib::SCENE_BATTLE)
-		return ret;
 
 	if (players[2]->timeStop > 1)
 		players[0]->timeStop = max(players[0]->timeStop + 1, 2);
@@ -1081,7 +1142,60 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 	players[1]->score = max(players[1]->score, players[3]->score);
 	players[2]->score = max(players[0]->score, players[2]->score);
 	players[3]->score = max(players[1]->score, players[3]->score);
-	return ret;
+
+	// 4P replay sidecar. keyMap now holds the input this frame was simulated
+	// with, and loadExtraPlayerInputs published sidecarInputs[frame] for it on
+	// playback, so both directions use the same index. Recording writes by
+	// index rather than appending: a re-simulated frame overwrites its own
+	// entry instead of adding a duplicate. Local versus only -- four machines
+	// each writing a copy of one live match buys nothing.
+	if (
+		SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY &&
+		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSPLAYER
+	) {
+		if (sidecarInputs.size() <= rollbackState.frame)
+			sidecarInputs.resize(rollbackState.frame + 1);
+		sidecarInputs[rollbackState.frame] = {
+			packKeyInput(dataMgr->players[2]->keyMap),
+			packKeyInput(dataMgr->players[3]->keyMap)
+		};
+		// Flushed periodically: the replay-save site is not hooked, and a
+		// crash mid-match would otherwise lose the whole recording.
+		if ((rollbackState.frame + 1) % 300 == 0)
+			sidecarSave();
+	}
+	rollbackState.frame++;
+}
+
+// Replaces `mov ecx, esi; call edx; test eax, eax` at 0x482745, inside
+// CBattleManager::onProcess's frame loop. edx is the handler for the current
+// battle state and esi the battle manager; this runs once per SIMULATED frame,
+// however many of those one call makes. Every jump-table arm of the loop lands
+// here, and it does not overlap giuroll's hook at 0x482701 at the top of the
+// same loop -- which takes the savestate, so a saved frame is always the state
+// before Pre.
+static const DWORD frameLoopContinue = 0x48274D;
+static const DWORD frameLoopExit = 0x482755;
+
+static void __declspec(naked) simulatedFrameHook()
+{
+	__asm {
+		PUSH EDX
+		MOV ECX, ESI
+		CALL onSimulatedFramePre
+		POP EDX
+		MOV ECX, ESI
+		CALL EDX
+		PUSH EAX
+		MOV ECX, ESI
+		CALL onSimulatedFramePost
+		POP EAX
+		TEST EAX, EAX
+		JNE leaveLoop
+		JMP dword ptr [frameLoopContinue]
+	leaveLoop:
+		JMP dword ptr [frameLoopExit]
+	}
 }
 
 unsigned short getRandomCard(const std::vector<unsigned short> &list, const std::map<unsigned short, unsigned char> &other)
@@ -1902,9 +2016,9 @@ int loadExtraPlayerInputs()
 	// why 4P replays never worked, and why they failed by diverging rather
 	// than by crashing.
 	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
-		if (sidecarCursor < sidecarInputs.size()) {
-			replayExtraInputs[0].inKeys.raw = sidecarInputs[sidecarCursor][0];
-			replayExtraInputs[1].inKeys.raw = sidecarInputs[sidecarCursor][1];
+		if (rollbackState.frame < sidecarInputs.size()) {
+			replayExtraInputs[0].inKeys.raw = sidecarInputs[rollbackState.frame][0];
+			replayExtraInputs[1].inKeys.raw = sidecarInputs[rollbackState.frame][1];
 		} else {
 			// Ran past the sidecar: hold neutral rather than repeat the last
 			// input forever, which would look like a stuck stick.
@@ -1973,8 +2087,8 @@ void __declspec(naked) healExtraChrs()
 		MOV ECX, [ESI + 0x18]
 		CALL [endRoundFct]
 		XOR ECX, ECX
-		MOV dword ptr [healing], ECX
-		MOV dword ptr [healing + 4], ECX
+		MOV dword ptr [rollbackState], ECX
+		MOV dword ptr [rollbackState + 4], ECX
 		JMP og_switchBattleStateBreakAddr
 	}
 }
@@ -1987,7 +2101,7 @@ int __fastcall onHudRender(CInfoManager *This)
 {
 	setRenderMode(2);
 	for (int i = 0; i < 2; i++) {
-		auto &h = (&healing.first)[i];
+		auto &h = (&rollbackState.healing.first)[i];
 		auto p = dataMgr->players[(dataMgr->players[i]->objectBase.hp == 0 ? 0 : 2) + i];
 
 		if (p->objectBase.hp)
@@ -4406,12 +4520,31 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 
 	const uint8_t versionString2v2[] = {
 		0x41, 0xD0, 0x3B, 0x30, 0x64, 0x41, 0x74, 0xC8,
-		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x96
+		// Last byte bumped 0x96 -> 0x97 for the per-frame team logic: an older
+		// 4PSoku joining this relay would play, then desync at the first heal.
+		// The relay refuses a mismatch at the door and says why.
+		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x97
 	};
 
 	myModule = hMyModule;
 	GetModuleFileName(hMyModule, modFolder, 1024);
 	PathRemoveFileSpec(modFolder);
+
+	// Without assets.dat the mod still repoints the engine at its own menu and
+	// scene files, the engine's loader fails to open them, and the engine
+	// dereferences the null it gets back without checking -- a crash dump on
+	// the profile screen and no hint why. Refuse to load instead: the game then
+	// runs unmodded, and the player is told the one thing they need to fix.
+	if (GetFileAttributesA((std::string(modFolder) + "\\assets.dat").c_str()) == INVALID_FILE_ATTRIBUTES) {
+		MessageBoxA(
+			nullptr,
+			(std::string("4PSoku is missing assets.dat.\n\nIt must sit next to 4PSoku.dll in:\n") + modFolder +
+			"\n\nThe mod has been disabled for this session; the game will start without it.").c_str(),
+			"4PSoku",
+			MB_ICONERROR
+		);
+		return false;
+	}
 	puts("Hello");
 	// DWORD old;
 	loadSoku2Config();
@@ -4501,6 +4634,10 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	*(char *)0x481AAE = 0x8B;
 	*(char *)0x481AAF = 0xC8;
 	SokuLib::TamperNearCall(0x481AB0, onDeath);
+	// Six bytes replaced, five of them by the jmp; the sixth is the tail of
+	// `test eax, eax` and must not be executed on its own.
+	SokuLib::TamperNearJmp(0x482745, simulatedFrameHook);
+	*(unsigned char *)0x48274A = 0x90;
 	*(char *)0x47D6AC = 0;
 	*(char *)0x47D6B8 = 0;
 

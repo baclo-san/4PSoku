@@ -8,7 +8,18 @@
 #include "Server.hpp"
 
 #define BUFFER_SIZE 1024
-#define CHARACTER_INPUT_DELAY 30
+// Frames of input delay in character select, where the relay runs strict
+// lockstep: nobody sees frame F until every player's input for F has arrived.
+//
+// This was a fixed 30 -- half a second between pressing a button and seeing the
+// cursor move, for every player, on every connection. That is what testers
+// described as "extremely laggy" with a single 40 ms player in the room: the
+// network was never the problem. The delay only has to cover the round trip
+// through the relay; 10 frames (~167 ms) does that for anyone under ~150 ms
+// without the lockstep ever stalling. Set with the relay's third argument.
+// Changing it mid-session is safe; changing it mid-SCENE is not, which is why
+// it is only read once at startup.
+unsigned characterInputDelay = 10;
 
 // How many character-select frames one reply may carry.
 //
@@ -40,7 +51,10 @@
 
 const uint8_t versionString2v2[] = {
 	0x41, 0xD0, 0x3B, 0x30, 0x64, 0x41, 0x74, 0xC8,
-	0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x96
+	// Last byte bumped 0x96 -> 0x97 for the per-frame team logic: an older
+	// 4PSoku joining this relay would play, then desync at the first heal.
+	// The relay refuses a mismatch at the door and says why.
+	0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x97
 };
 
 const char emptyMagicString[32] = "\0\x1F\x54\xF2\xA2\x67\x90\x78\xC2";
@@ -70,6 +84,13 @@ static constexpr unsigned char PACKET_PEER_LIST = 0x78;
 // first, and a relay that gated on its own state machine is exactly what froze
 // character select for two sessions.
 static constexpr unsigned char PACKET_ROLLBACK_INPUT = 0x6b;
+
+// giuroll's "I pressed Esc and left the match" (lib.rs esc_host/esc_client).
+// It goes to the game's socket, whose only peer is this relay, so unless the
+// relay passes it on nobody hears it: the three players left behind sit on a
+// frozen screen waiting for input that will never come. A giuroll that
+// receives it ends the match on its side, which is what everyone wants.
+static constexpr unsigned char PACKET_ROLLBACK_ESC = 0x6e;
 
 static const char *stateName(int state)
 {
@@ -140,7 +161,7 @@ static bool isHandledType(unsigned char type)
 	case PLAYER_JOIN_ACK:
 		return true;
 	default:
-		return type == PACKET_ROLLBACK_INPUT;
+		return type == PACKET_ROLLBACK_INPUT || type == PACKET_ROLLBACK_ESC;
 	}
 }
 
@@ -244,6 +265,20 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 	// has no case for the type -- each one would print as a misparsed union.
 	if ((unsigned char)packet.type == PACKET_ROLLBACK_INPUT)
 		return this->_relayRollbackInput(client, &packet, packetSize);
+	if ((unsigned char)packet.type == PACKET_ROLLBACK_ESC) {
+		if (client.state == nullptr || client.slotId < 0)
+			return;
+		std::cout << "\"" << client.name << "\" (slot " << (int)client.slotId
+			<< ") pressed Esc and left the match -- telling the other players" << std::endl;
+		for (auto &other : this->_clients) {
+			if (&other.second == &client)
+				continue;
+			if (other.second.state == nullptr || other.second.slotId < 0)
+				continue;
+			this->_send(other.second, &packet, packetSize);
+		}
+		return;
+	}
 
 	if (
 		(packet.type != CLIENT_GAME || packet.base.game.event.type != SokuLib::GAME_INPUT) &&
@@ -553,9 +588,9 @@ void Server::_handlePacketGame(Client &client, SokuLib::GameLoadedEvent &packet,
 			this->_send(client, &game, sizeof(packet) + sizeof(SokuLib::PacketType));
 			this->_setState(client, END_OF_FIGHT);
 			client.state->frameIdOffset = 0;
-			client.state->lastFrameId = CHARACTER_INPUT_DELAY;
+			client.state->lastFrameId = characterInputDelay;
 			client.state->inputs.clear();
-			client.state->inputs.resize(CHARACTER_INPUT_DELAY, {.raw = 0});
+			client.state->inputs.resize(characterInputDelay, {.raw = 0});
 		} else if (client.state->state == JOINING) {
 			SokuLib::PacketGame game{SokuLib::HOST_GAME};
 
@@ -627,7 +662,7 @@ void Server::_handlePacketGame(Client &client, SokuLib::GameInputEvent &packet, 
 	// battle already agreeing. Four independent streams do not.
 	if (client.state->inputScene != packet.sceneId) {
 		unsigned delay = packet.sceneId == SokuLib::SCENEID_CHARACTER_SELECT
-			? CHARACTER_INPUT_DELAY
+			? characterInputDelay
 			: BATTLE_INPUT_DELAY;
 
 		// Same form as the bootstrap branch of _handleChrSelectInput, so
@@ -659,7 +694,7 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 	game->event.input.sceneId = packet.sceneId;
 	if (this->allSlotsFilled()) {
 		for (int i = 0; i < packet.inputCount; i++)
-			if (client.state->lastFrameId == packet.frameId + i + CHARACTER_INPUT_DELAY) {
+			if (client.state->lastFrameId == packet.frameId + i + characterInputDelay) {
 				client.state->inputs.push_back(packet.inputs[i]);
 				client.state->lastFrameId++;
 			}
@@ -711,9 +746,9 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 		}
 	} else {
 		client.state->inputs.clear();
-		client.state->inputs.resize(CHARACTER_INPUT_DELAY, {.raw = 0});
+		client.state->inputs.resize(characterInputDelay, {.raw = 0});
 		client.state->frameIdOffset = packet.frameId + 1;
-		client.state->lastFrameId = client.state->frameIdOffset + CHARACTER_INPUT_DELAY;
+		client.state->lastFrameId = client.state->frameIdOffset + characterInputDelay;
 		game->event.input.frameId = packet.frameId + 1;
 		// Same 80-byte ceiling as the branch above. This one echoes the
 		// client's own count, which is 1 for a client that is keeping up -- but
@@ -1098,6 +1133,22 @@ void Server::_sendPeerList(Server::Client &client)
 void Server::_disconnect(Server::Client &client)
 {
 	std::cout << client.ip.toString() << ":" << client.port << " disconnected." << std::endl;
+
+	// A socket that only ever said HELLO, from the same address as a player who
+	// got further. That is a second program speaking for the same machine --
+	// in practice autopunch, which proxies the game's traffic through a socket
+	// of its own for vanilla 1v1 and does not understand this relay. Replies
+	// then go to whichever socket asked, the game misses the ones it waits for,
+	// and the player is thrown back to the menu with nothing in any log to say
+	// why. Seen live 2026-09-08: four joins in a row, each ending this way.
+	if (client.status == STATUS_POLITE)
+		for (auto &other : this->_clients)
+			if (&other.second != &client && other.second.ip == client.ip && other.second.status > STATUS_POLITE) {
+				std::cout << "    hint: " << client.ip.toString() << " had a second socket that only ever sent HELLO. "
+					<< "If that player keeps getting thrown out of character select, have them "
+					<< "DISABLE AUTOPUNCH -- the relay already does its job." << std::endl;
+				break;
+			}
 	for (auto &pair : client.unhandled)
 		std::cout << "    sent " << pair.second << " packets of unhandled type "
 			<< (int)pair.first << " (a mod on their machine, not this protocol)"
