@@ -292,7 +292,7 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 	if (
 		(packet.type != CLIENT_GAME || packet.base.game.event.type != SokuLib::GAME_INPUT) &&
 		packet.type != CHAIN &&
-		this->_logHandshakeOnce(client, packet)
+		this->_logHandshakeOnce(client, packet, false)
 	) {
 		std::cout << "[" << client.ip.toString() << ":" << client.port << "<]: ";
 		displayPacketContent(std::cout, packet);
@@ -811,22 +811,47 @@ void Server::_relayRollbackInput(Client &client, void *data, size_t size)
 }
 
 // Whether this handshake packet is worth printing, which is once per kind.
-bool Server::_logHandshakeOnce(Client &client, CustomPacket &packet)
+bool Server::_logHandshakeOnce(Client &client, CustomPacket &packet, bool outgoing)
 {
-	unsigned short key;
+	// What makes one packet of a kind different enough from the last to be
+	// worth another line. Everything the game or the mod RESENDS until
+	// answered is in here: a slot ack goes out every frame until the echo
+	// comes back, so a player with a one-second round trip printed some sixty
+	// identical lines per join, and the console scrolled away the one event
+	// anyone needed -- which is how a freeze came to look like "nothing
+	// unusual" (2026-09-26). The key carries the direction and the content
+	// that matters, so a CHANGE still prints: another slot, another name.
+	unsigned sub;
 
-	switch (packet.type) {
+	switch ((unsigned char)packet.type) {
 	case LOADING_READY:
-		key = (unsigned short)LOADING_READY << 8;
+	case HELLO:
+	case OLLEH:
+	case INIT_REQUEST:
+	case UNLOCK_CHAR_SELECT:
+		sub = 0;
 		break;
 	case HOST_GAME:
 	case CLIENT_GAME:
-		key = ((unsigned short)packet.type << 8) | (unsigned char)packet.base.game.event.type;
+		sub = (unsigned char)packet.base.game.event.type;
 		break;
+	case PLAYER_JOIN_ACK:
+		sub = (unsigned char)packet.playerJoinAck.slot;
+		break;
+	case PLAYER_JOIN: {
+		unsigned nameHash = 0;
+
+		for (char c : packet.playerJoin.name)
+			nameHash = nameHash * 31 + (unsigned char)c;
+		sub = (unsigned char)packet.playerJoin.slot | ((nameHash & 0xFFFF) << 8);
+		break;
+	}
 	default:
 		return true;
 	}
-	return client.handshakeLogged.insert(key).second;
+	return client.handshakeLogged.insert(
+		(outgoing ? 0x80000000u : 0u) | ((unsigned)(unsigned char)packet.type << 24) | (sub & 0xFFFFFF)
+	).second;
 }
 
 // Every state change, named, for both players and the reader.
@@ -1090,7 +1115,7 @@ void Server::_send(Server::Client &client, void *data, size_t size)
 		packet.type != CHAIN &&
 		(unsigned char)packet.type != PACKET_PEER_LIST &&
 		(unsigned char)packet.type != PACKET_ROLLBACK_INPUT &&
-		this->_logHandshakeOnce(client, packet)
+		this->_logHandshakeOnce(client, packet, true)
 	) {
 		std::cout << "[" << client.ip.toString() << ":" << client.port << ">]: ";
 		displayPacketContent(std::cout, packet);

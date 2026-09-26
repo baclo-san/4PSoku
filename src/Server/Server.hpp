@@ -75,7 +75,7 @@ private:
 		// interesting part of two separate sessions out of the paste buffer.
 		// Cleared whenever a client returns to character select, so the next
 		// match's handshake is reported afresh.
-		std::set<unsigned short> handshakeLogged;
+		std::set<unsigned> handshakeLogged;
 		// Whether this client's rollback traffic has ever reached the relay.
 		// It only should when a peer could not be hole-punched, so seeing it
 		// at all is worth exactly one line.
@@ -169,7 +169,7 @@ private:
 	void _handlePacketGameLoadAck(Client &client, SokuLib::GameLoadedEvent &packet, size_t packetSize);
 
 	void _relayRollbackInput(Client &client, void *data, size_t size);
-	bool _logHandshakeOnce(Client &client, CustomPacket &packet);
+	bool _logHandshakeOnce(Client &client, CustomPacket &packet, bool outgoing);
 	void _setState(PlayerState &state, GameStateStep to);
 	void _setState(Client &client, GameStateStep to);
 

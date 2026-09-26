@@ -7,6 +7,73 @@
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
 #include <iostream>
+#include <fstream>
+#include <streambuf>
+#include <string>
+#include <cstdio>
+
+// Everything written to std::cout also goes to a file next to the exe, and
+// every line gets a wall-clock timestamp in both.
+//
+// The console alone lost the evidence twice: once to its own flood, and once
+// to a freeze that happened while a slot-ack loop was scrolling it away. A
+// file keeps the whole session, and the timestamps turn "it froze" into
+// "nothing went to that player for 1.8 seconds after 23:10:41.200".
+class TeeBuf : public std::streambuf {
+public:
+	TeeBuf(std::streambuf *console, std::streambuf *file) : _console(console), _file(file) {}
+
+protected:
+	int overflow(int c) override
+	{
+		if (c == EOF)
+			return 0;
+		if (this->_lineStart) {
+			SYSTEMTIME t;
+			char stamp[32];
+
+			GetLocalTime(&t);
+			int n = snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+			this->_console->sputn(stamp, n);
+			this->_file->sputn(stamp, n);
+			this->_lineStart = false;
+		}
+		this->_console->sputc((char)c);
+		this->_file->sputc((char)c);
+		if (c == '\n')
+			this->_lineStart = true;
+		return c;
+	}
+
+	// std::endl lands here, so each finished line reaches the disk: a relay
+	// that is killed or crashes still leaves everything up to its last line.
+	int sync() override
+	{
+		this->_console->pubsync();
+		this->_file->pubsync();
+		return 0;
+	}
+
+private:
+	std::streambuf *_console;
+	std::streambuf *_file;
+	bool _lineStart = true;
+};
+
+static std::string logPathNextToExe()
+{
+	char exe[MAX_PATH];
+	SYSTEMTIME t;
+	char name[64];
+	std::string dir;
+
+	GetModuleFileNameA(nullptr, exe, sizeof(exe));
+	dir = exe;
+	dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+	GetLocalTime(&t);
+	snprintf(name, sizeof(name), "relay-%04d%02d%02d-%02d%02d%02d.log", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+	return dir + name;
+}
 #include <cstdint>
 #include <thread>
 #include "Server.hpp"
@@ -64,6 +131,13 @@ int main(int argc, char **argv)
 	// whole timer ticks, 15.6 ms by default, so every relayed packet could sit
 	// unread for a full tick. In character select's lockstep that is added to
 	// every input. timeBeginPeriod(1) below makes 1 ms mean 1 ms.
+	static std::ofstream logFile{logPathNextToExe()};
+	static TeeBuf tee{std::cout.rdbuf(), logFile.rdbuf()};
+
+	if (logFile)
+		std::cout.rdbuf(&tee);
+	std::cout << "Logging to " << (logFile ? logPathNextToExe() : std::string("NOWHERE -- could not open a log file next to the exe")) << std::endl;
+
 	uint64_t sleepTime = 1000;
 
 #ifndef _DEBUG
