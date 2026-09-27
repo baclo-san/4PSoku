@@ -472,6 +472,24 @@ const auto getInputManagerIndex = (char (*)(int index))0x43E070;
 const auto initInputManagerArray = (SokuLib::KeyManager *(*)(int index, bool))0x43E6A0;
 
 static std::array<std::map<unsigned char, std::vector<Deck>>, 5> loadedDecks;
+
+// The decks a seat chooses from in character select.
+//
+// Locally each seat has its own profile, so seat N browses profile N. Online
+// there is one player per machine and their decks are profile 0's, which is
+// where generateFakeDecks takes the chosen deck from. The selector, its
+// length and the list drawn on screen used to come from profile N anyway, so
+// a P2/P3/P4 player scrolled through one profile's list and was dealt the deck
+// at that position in ANOTHER -- or the default or random deck, when the two
+// lists differ in length. Reported live 2026-09-28 by a P4 whose deck "was
+// wrong again": every machine agreed on it, because it was his own game that
+// picked it.
+static std::vector<Deck> &deckChoices(int slot, SokuLib::Character chr)
+{
+	bool online = SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER || SokuLib::mainMode == SokuLib::BATTLE_MODE_VSCLIENT;
+
+	return loadedDecks[online ? 0 : slot][chr];
+}
 std::map<unsigned char, std::map<unsigned short, SokuLib::DrawUtils::Sprite>> cardsTextures;
 std::map<unsigned, std::vector<unsigned short>> characterSpellCards;
 std::map<unsigned, std::array<unsigned short, 20>> defaultDecks;
@@ -1328,7 +1346,7 @@ void selectProcessCommon(SokuLib::Select *This, int ret)
 
 	for (int i = 0; i < 2; i++) {
 		if ((&This->leftSelectionStage)[i] == 1) {
-			auto &decks = loadedDecks[i][(&SokuLib::leftPlayerInfo)[i].character];
+			auto &decks = deckChoices(i, (&SokuLib::leftPlayerInfo)[i].character);
 			auto input = (&This->leftKeys)[i]->input.horizontalAxis;
 
 			if (input == -1 || (input <= -36 && input % 6 == 0)) {
@@ -1611,13 +1629,13 @@ int __fastcall CSelect_OnRender(SokuLib::Select *This)
 	auto ret = (This->*s_originalSelectOnRender)();
 
 	if (This->leftSelectionStage == 1 && SokuLib::leftChar != SokuLib::CHARACTER_RANDOM)
-		renderDeck(SokuLib::leftChar, selectedDecks[0], loadedDecks[0][SokuLib::leftChar],  {28, 98});
+		renderDeck(SokuLib::leftChar, selectedDecks[0], deckChoices(0, SokuLib::leftChar),  {28, 98});
 	if (This->rightSelectionStage == 1 && SokuLib::rightChar != SokuLib::CHARACTER_RANDOM)
-		renderDeck(SokuLib::rightChar, selectedDecks[1], loadedDecks[1][SokuLib::rightChar], {28, 384});
+		renderDeck(SokuLib::rightChar, selectedDecks[1], deckChoices(1, SokuLib::rightChar), {28, 384});
 	if (chrSelectExtra[0].selectState == 1 && assists.first.character != SokuLib::CHARACTER_RANDOM)
-		renderDeck(assists.first.character, chrSelectExtra[0].deckHandler.pos, loadedDecks[2][assists.first.character],  {178, 98});
+		renderDeck(assists.first.character, chrSelectExtra[0].deckHandler.pos, deckChoices(2, assists.first.character),  {178, 98});
 	if (chrSelectExtra[1].selectState == 1 && assists.second.character != SokuLib::CHARACTER_RANDOM)
-		renderDeck(assists.second.character, chrSelectExtra[1].deckHandler.pos, loadedDecks[3][assists.second.character], {178, 384});
+		renderDeck(assists.second.character, chrSelectExtra[1].deckHandler.pos, deckChoices(3, assists.second.character), {178, 384});
 	return ret;
 }
 
@@ -1641,13 +1659,13 @@ void onlineChrSelectRenderCommon(SokuLib::Select *This)
 		cursors2[selectedSlot].draw();
 	}
 	if (remoteMySlot == 0 && This->leftSelectionStage == 1 && SokuLib::leftChar != SokuLib::CHARACTER_RANDOM)
-		renderDeck(SokuLib::leftChar, selectedDecks[0], loadedDecks[0][SokuLib::leftChar],  {28, 98});
+		renderDeck(SokuLib::leftChar, selectedDecks[0], deckChoices(0, SokuLib::leftChar),  {28, 98});
 	if (remoteMySlot == 1 && This->rightSelectionStage == 1 && SokuLib::rightChar != SokuLib::CHARACTER_RANDOM)
-		renderDeck(SokuLib::rightChar, selectedDecks[1], loadedDecks[1][SokuLib::rightChar], {28, 384});
+		renderDeck(SokuLib::rightChar, selectedDecks[1], deckChoices(1, SokuLib::rightChar), {28, 384});
 	if (remoteMySlot == 2 && chrSelectExtra[0].selectState == 1 && assists.first.character != SokuLib::CHARACTER_RANDOM)
-		renderDeck(assists.first.character, chrSelectExtra[0].deckHandler.pos, loadedDecks[2][assists.first.character],  {178, 98});
+		renderDeck(assists.first.character, chrSelectExtra[0].deckHandler.pos, deckChoices(2, assists.first.character),  {178, 98});
 	if (remoteMySlot == 3 && chrSelectExtra[1].selectState == 1 && assists.second.character != SokuLib::CHARACTER_RANDOM)
-		renderDeck(assists.second.character, chrSelectExtra[1].deckHandler.pos, loadedDecks[3][assists.second.character], {178, 384});
+		renderDeck(assists.second.character, chrSelectExtra[1].deckHandler.pos, deckChoices(3, assists.second.character), {178, 384});
 }
 
 int __fastcall CSelectCL_OnRender(SokuLib::SelectClient *This)
@@ -2776,7 +2794,7 @@ void updateCharacterSelect2(SokuLib::Select *This, unsigned i)
 			dat.object->setPose(0);
 			if (lastChrs[2 + i] != info.character)
 				dat.deckHandler.pos = 0;
-			dat.deckHandler.maxValue = loadedDecks[2 + i][info.character].size() + 3;
+			dat.deckHandler.maxValue = deckChoices(2 + i, info.character).size() + 3;
 		} else if (dat.input->input.b == 1) {
 		} else if (dat.input->input.d == 1) {
 			SokuLib::playSEWaveBuffer(SokuLib::SFX_MENU_CONFIRM);
