@@ -166,6 +166,11 @@ private:
 	// Every client is sent exactly these, so every client simulates the same
 	// frames -- which is all character select needs to stay in agreement.
 	std::vector<std::array<SokuLib::Inputs, 4>> _chrHistory;
+	// For the "nobody can reach this relay" hint in update().
+	unsigned short _port = 0;
+	sf::Clock _startedAt;
+	bool _remoteSeen = false;
+	bool _unreachableHinted = false;
 	// For the stall line: when a frame was last decided, and who held up the
 	// latest attempt. _advanceChrSelect clears the pointer on entry and the
 	// caller reads it straight after, so it never outlives its player.

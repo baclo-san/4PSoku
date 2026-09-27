@@ -179,6 +179,8 @@ Server::Server(unsigned short port)
 	this->_sock.setBlocking(false);
 	if (this->_sock.bind(port, sf::IpAddress::Any) != sf::Socket::Done)
 		throw std::runtime_error("Bind to port" + std::to_string(port) + " failed.");
+	this->_port = port;
+	std::cout << "Relay listening on UDP port " << port << " (all interfaces)." << std::endl;
 }
 
 void Server::update()
@@ -189,6 +191,27 @@ void Server::update()
 	sf::IpAddress ip;
 	unsigned short port;
 
+	// Nobody from outside this machine after a minute, while someone here is
+	// waiting: the relay cannot be reached. It binds every interface, so that
+	// is the network's doing, and the usual culprit is Windows Firewall --
+	// 2v2Server.exe is a new program, so it is blocked from receiving until
+	// allowed, even where the game itself already is. A host whose 1v1 and
+	// 2v2-as-guest both worked hit exactly this (2026-09-27): the log showed
+	// only 127.0.0.1 and nothing else, ever.
+	if (
+		!this->_remoteSeen && !this->_unreachableHinted && !this->_clients.empty() &&
+		this->_startedAt.getElapsedTime().asSeconds() >= 60
+	) {
+		this->_unreachableHinted = true;
+		std::cout
+			<< "NOBODY FROM OUTSIDE HAS REACHED THIS RELAY in a minute -- only this machine. "
+			<< "Other players' packets are not arriving at all. Check, in this order:" << std::endl
+			<< "  1. Windows Firewall: allow 2v2Server.exe on PUBLIC and private networks "
+			<< "(Windows Security > Firewall > Allow an app, or delete its blocked entry and "
+			<< "restart the relay to get the prompt again). Allowing the game is not enough." << std::endl
+			<< "  2. The router forwards UDP port " << this->_port << " to this PC." << std::endl
+			<< "  3. The others connect to this PC's PUBLIC address and port " << this->_port << "." << std::endl;
+	}
 	while (true) {
 		for (auto &c : this->_clients) {
 			// The CHAIN deadline only for clients that are sent CHAIN, which is
@@ -250,6 +273,8 @@ void Server::update()
 
 		if (it == this->_clients.end()) {
 			std::cout << "New connection from " << ip.toString() << ":" << port << std::endl;
+			if (ip.toString() != "127.0.0.1")
+				this->_remoteSeen = true;
 			this->_clients.emplace(std::pair{ip, port}, Client{ip, port});
 			it = this->_clients.find({ip, port});
 		}
