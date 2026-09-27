@@ -123,7 +123,7 @@ namespace SokuLib {
 int main(int argc, char **argv)
 {
 	if (argc < 2 || argc > 4) {
-		std::cerr << "Usage: " << argv[0] << " <port> [poll_interval_us=1000] [chrselect_delay_frames=10]" << std::endl;
+		std::cerr << "Usage: " << argv[0] << " <port> [poll_interval_us=1000] [chrselect_window_frames=20]" << std::endl;
 		return EXIT_FAILURE;
 	}
 
@@ -146,13 +146,13 @@ int main(int argc, char **argv)
 		if (argc >= 3)
 			sleepTime = std::stoull(argv[2]);
 		if (argc >= 4)
-			characterInputDelay = std::stoul(argv[3]);
-		if (characterInputDelay < 2 || characterInputDelay > 30)
-			throw std::invalid_argument("chrselect_delay_frames must be between 2 and 30");
+			chrSelectWindow = std::stoul(argv[3]);
+		if (chrSelectWindow < 4 || chrSelectWindow > 60)
+			throw std::invalid_argument("chrselect_window_frames must be between 4 and 60");
 		timeBeginPeriod(1);
-		std::cout << "Polling every " << sleepTime << " us; character select input delay "
-			<< characterInputDelay << " frames (~" << characterInputDelay * 1000 / 60
-			<< " ms). If character select stutters for someone far away, raise the delay." << std::endl;
+		std::cout << "Polling every " << sleepTime << " us; character select window "
+			<< chrSelectWindow << " frames (~" << chrSelectWindow * 1000 / 60
+			<< " ms). Character select only waits for a player whose ping is above that." << std::endl;
 		if (sleepTime > 1000000 / 60)
 			std::cerr << "Warning: Sleep time value is higher than 1/60s. This may induce some lag during games." << std::endl;
 

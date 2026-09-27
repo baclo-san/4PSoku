@@ -21,6 +21,12 @@
 // it is only read once at startup.
 unsigned characterInputDelay = 10;
 
+// How many character-select frames the relay may run ahead of the slowest
+// player's acknowledgement before it waits. Only a player whose round trip to
+// the relay exceeds this many frames ever feels it: at 20 that is ~330 ms.
+// Set with the relay's third argument.
+unsigned chrSelectWindow = 20;
+
 // How many character-select frames one reply may carry.
 //
 // THIS IS THE 4P CHARACTER-SELECT FREEZE. The game's input-packet codec works
@@ -716,6 +722,8 @@ void Server::_handlePacketGame(Client &client, SokuLib::GameInputEvent &packet, 
 		client.state->inputs.clear();
 		client.state->inputs.resize(delay, {.raw = 0});
 		client.state->inputScene = packet.sceneId;
+		if (packet.sceneId == SokuLib::SCENEID_CHARACTER_SELECT)
+			this->_resetChrSelectClock(*client.state, packet.frameId);
 	}
 	if (client.state->state == SELECT_CHARACTER)
 		this->_handleChrSelectInput(client, packet);
@@ -736,124 +744,73 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 	game->event.type = SokuLib::GAME_INPUT;
 	game->event.input.sceneId = packet.sceneId;
 	if (this->allSlotsFilled()) {
-		for (int i = 0; i < packet.inputCount; i++)
-			if (client.state->lastFrameId == packet.frameId + i + characterInputDelay) {
-				client.state->inputs.push_back(packet.inputs[i]);
-				client.state->lastFrameId++;
-			}
-
-		unsigned lastFrame = client.state->lastFrameId;
-		// Which player is holding the barrier, kept only so the stall report
-		// can name them. The minimum on its own says a stall happened; it does
-		// not say whose game stopped, which is the only thing worth logging.
-		const PlayerState *slowest = client.state;
-
-		for (auto &player : this->_state.players)
-			if (player.state == SELECT_CHARACTER) {
-				unsigned reach = player.lastFrameId - player.frameIdOffset + client.state->frameIdOffset;
-
-				if (reach < lastFrame) {
-					lastFrame = reach;
-					slowest = &player;
-				}
-			}
-		if (lastFrame <= packet.frameId)
-			return this->_reportChrSelectStall(client, packet, *slowest);
-		this->_reportChrSelectProgress(client);
-
-		// The barrier above uses the true lastFrame; only the PAYLOAD is
-		// clamped. How far ahead everyone has got decides whether a frame may
-		// be sent at all, and that answer must not change because the packet
-		// carrying it has a size limit.
+		// Character select, clocked by the relay -- the way vanilla's host
+		// runs it, not lockstep.
 		//
-		// Clamping also removes a second, rarer death in the same expression:
-		// inputCount is a uint8_t and (lastFrame - packet.frameId) * 4 is not,
-		// so a gap of exactly 64 frames multiplies to 256 and truncates to
-		// zero -- a packet declaring no inputs, which the client rejects in the
-		// same way and never recovers from either.
-		// What the game does with this packet (the distributor at 0x454D30):
-		// it takes frameId minus the last frame it received as the number of
-		// NEW frames, and reads them from the highest index down -- so group 0
-		// is frame `frameId`, group 1 the frame before, and so on. Fewer groups
-		// than new frames and it drops the whole packet.
+		// This was lockstep: a frame went out only once every player's input
+		// FOR THAT FRAME had arrived, one frame per reply. A client could then
+		// advance one frame per round trip to the relay, so character select
+		// ran at 1000/ping fps: 25 fps for a 40 ms player, slower for anyone
+		// further away, and every cursor lagged by the worst connection.
 		//
-		// Each group now carries each player's input FOR THAT FRAME. It used to
-		// carry each player's LATEST input at the moment of asking, which differs
-		// between clients asking about the same frame at different times, and
-		// became a placeholder the instant a player moved on to loading -- even
-		// for frames whose real input was buffered. Whoever reached the end of
-		// stage select last therefore simulated different frames and never
-		// finished: three players waiting at loading, one alone in stage select
-		// (2026-09-26).
-		//
-		// ONE new frame per reply, still, and deliberately. The game stamps its
-		// OUTGOING input with its last RECEIVED frame (netmanager+0x98 is both),
-		// and the acceptance loop above takes only the next consecutive frame.
-		// Handing a client eight frames at once made its stamps jump by eight,
-		// the relay never accepted another input from anyone, and all four
-		// stalled one second into character select (2026-09-26, the build right
-		// after this was written). So character select still advances one frame
-		// per round trip -- 1000/ping fps -- until the game's own send side is
-		// understood well enough to change both ends together.
-		unsigned newest = packet.frameId + 1;
+		// Vanilla never worked that way. Its host (0x455960) runs its own
+		// clock, builds each frame from the client's LATEST input, and sends
+		// every frame the client has not acknowledged yet, newest first; it
+		// only waits if the client falls a whole window behind. The client
+		// (0x454C90) just sends its current input stamped with the last frame
+		// it received. So the relay does the host's job: it decides each frame
+		// ONCE from what each player has sent, records it, and hands the same
+		// recorded frames to everyone. Nobody waits on anybody's round trip,
+		// and every machine still simulates identical frames.
+		auto &state = *client.state;
 
-		// newest can be the renumbering frame itself: renumbering sets
-		// frameIdOffset to the client's frame + 1, which is exactly the next
-		// frame it needs, and no player has input for it (the buffer starts
-		// one after). It gets neutral input below, identically for everyone.
-		//
-		// This used to be `newest - frameIdOffset` groups and a return on
-		// zero -- which is always zero for the first frame after coming back
-		// from a battle. No reply, so the client never advanced, so the next
-		// packet asked for the same frame: every player stuck at the delay
-		// window forever, the black screen after the first match
-		// (2026-09-27). The first character select only escaped it because
-		// its joining handshake echoes frames before the exchange starts.
-		if (newest < client.state->frameIdOffset)
+		if (packet.frameId < state.chrBase)
 			return;
 
-		unsigned groups = std::min<unsigned>(MAX_CHRSELECT_FRAMES_PER_PACKET, newest - client.state->frameIdOffset + 1);
-		client.internalTimer++;
-		game->event.input.frameId = newest;
-		game->event.input.inputCount = groups * 4;
-		for (unsigned g = 0; g < groups; g++) {
-			unsigned frame = newest - g;
+		unsigned ack = packet.frameId - state.chrBase;
 
-			for (int j = 0; j < 4; j++) {
-				auto &out = game->event.input.inputs[g * 4 + j];
-				auto *p = this->_state.slots[j];
-				// Only character-select input, and only frames it covers. A
-				// player who has moved on to loading still HAS input for the
-				// frames the others have yet to simulate; those must be the
-				// real ones.
-				bool known = false;
-				unsigned pFrame = 0;
-
-				if (p != nullptr && (p->state == SELECT_CHARACTER || p->state == READY_TO_LOAD)) {
-					pFrame = frame - client.state->frameIdOffset + p->frameIdOffset;
-					known = pFrame > p->frameIdOffset && pFrame <= p->lastFrameId;
-				}
-				if (known)
-					out = p->getInput(pFrame);
-				else if (p != nullptr && pFrame <= p->frameIdOffset) {
-					// Before this player's first input in this scene: the
-					// renumbering frame. Nothing pressed -- a placeholder
-					// confirm press here would be a real press to the game.
-					out.raw = 0;
-				} else {
-					// Beyond anything the player sent. Derived from the frame,
-					// not from a per-client timer, so every client still gets
-					// the same thing for the same frame.
-					out.raw = 0;
-					out.charSelect.Z = (frame >> 2) & 1;
-				}
+		// An older packet overtaken by a newer one says nothing new.
+		if (ack < state.chrAck)
+			return;
+		state.chrAck = std::min<unsigned>(ack, this->_chrHistory.size());
+		// Element 0 is the client's input as of sending: 0x454C90 overwrites
+		// it every frame. One per packet, one packet per client frame.
+		if (packet.inputCount > 0) {
+			state.chrQueue.push_back(packet.inputs[0]);
+			// Bounded, so a player the window is holding back does not
+			// build up seconds of stale input to replay afterwards.
+			while (state.chrQueue.size() > 4)
+				state.chrQueue.pop_front();
+		}
+		if (!this->_advanceChrSelect()) {
+			// Nothing new was decided, so nobody else was sent anything; this
+			// client still gets whatever it has not acknowledged, which is
+			// what recovers a lost packet.
+			this->_sendChrSelectFrames(client);
+			// Waiting for someone's next packet is most of the time and means
+			// nothing. A full second of it while packets still arrive is a
+			// stall, and the one useful thing to say is who holds it and why.
+			if (
+				this->_chrLastAdvance.getElapsedTime().asSeconds() >= 1 &&
+				this->_chrStallReport.getElapsedTime().asSeconds() >= 5 &&
+				this->_chrBlocker != nullptr
+			) {
+				this->_chrStallReport.restart();
+				std::cout
+					<< "CHARSELECT STALLED at frame " << this->_chrHistory.size() << ": \""
+					<< (this->_chrBlocker->client ? this->_chrBlocker->client->name : "<gone>")
+					<< "\" " << this->_chrBlockReason << std::endl;
 			}
 		}
+		return;
 	} else {
 		client.state->inputs.clear();
 		client.state->inputs.resize(characterInputDelay, {.raw = 0});
 		client.state->frameIdOffset = packet.frameId + 1;
 		client.state->lastFrameId = client.state->frameIdOffset + characterInputDelay;
+		// Not everyone is seated yet: the frame about to be echoed is the
+		// clock's neutral first frame, so the clock starts from here.
+		this->_resetChrSelectClock(*client.state, packet.frameId);
 		game->event.input.frameId = packet.frameId + 1;
 		// Same 80-byte ceiling as the branch above. This one echoes the
 		// client's own count, which is 1 for a client that is keeping up -- but
@@ -965,6 +922,129 @@ void Server::_setState(Client &client, GameStateStep to)
 		this->_setState(*client.state, to);
 }
 
+// Start the character-select clock over, for everyone, from `state`'s client
+// having last received its frame `lastClientFrame`.
+//
+// Relay frame 1 is a neutral frame every client is given first (it is the one
+// echoed while the room is filling up). Called whenever a client (re)enters
+// character select. The clock cannot have run past frame 1 then:
+// _advanceChrSelect only runs while every seat is in character select, and
+// this client was not.
+void Server::_resetChrSelectClock(PlayerState &state, unsigned lastClientFrame)
+{
+	state.chrBase = lastClientFrame;
+	state.chrAck = 0;
+	state.chrQueue.clear();
+	this->_chrHistory.assign(1, {});
+	for (auto &in : this->_chrHistory[0])
+		in.raw = 0;
+}
+
+// Decide as many new character-select frames as the players' games allow, and
+// send them. Returns whether any were decided.
+//
+// A frame is decided when every player still in character select has sent an
+// input for it -- one packet each, which their games send once per frame they
+// run -- so the relay runs at the pace of the slowest GAME, not the slowest
+// connection. That also keeps it from drifting ahead of a client whose clock
+// runs a little slow, which a timer here would do. The one thing that makes it
+// wait on the network is the window: nobody is let more than chrSelectWindow
+// frames past what they have acknowledged.
+//
+// Players who have finished (READY_TO_LOAD) get the same placeholder as
+// before: they already simulated every frame they needed, and so will
+// everyone else, from the same record.
+bool Server::_advanceChrSelect()
+{
+	bool advanced = false;
+
+	this->_chrBlocker = nullptr;
+	while (true) {
+		bool anySelecting = false;
+		bool blocked = false;
+
+		for (auto *p : this->_state.slots) {
+			if (p == nullptr) {
+				blocked = true;
+				break;
+			}
+			if (p->state == READY_TO_LOAD)
+				continue;
+			if (p->state != SELECT_CHARACTER)
+				this->_chrBlockReason = "is not in character select yet";
+			else if (p->inputScene != SokuLib::SCENEID_CHARACTER_SELECT)
+				this->_chrBlockReason = "has not sent character-select input yet";
+			else if (p->chrQueue.empty())
+				this->_chrBlockReason = "has sent no new input (game stopped, or packets lost)";
+			else if (this->_chrHistory.size() - p->chrAck >= chrSelectWindow)
+				this->_chrBlockReason = "has not acknowledged the last window of frames (ping above the window?)";
+			else {
+				anySelecting = true;
+				continue;
+			}
+			this->_chrBlocker = p;
+			blocked = true;
+			break;
+			anySelecting = true;
+		}
+		if (blocked || !anySelecting)
+			break;
+
+		std::array<SokuLib::Inputs, 4> frame;
+		unsigned number = this->_chrHistory.size() + 1;
+
+		for (int j = 0; j < 4; j++) {
+			auto *p = this->_state.slots[j];
+
+			if (p->state == SELECT_CHARACTER) {
+				frame[j] = p->chrQueue.front();
+				p->chrQueue.pop_front();
+			} else {
+				frame[j].raw = 0;
+				frame[j].charSelect.Z = (number >> 2) & 1;
+			}
+		}
+		this->_chrHistory.push_back(frame);
+		advanced = true;
+		this->_chrLastAdvance.restart();
+	}
+	if (advanced)
+		for (auto *p : this->_state.slots)
+			if (p && p->client && p->state == SELECT_CHARACTER)
+				this->_sendChrSelectFrames(*p->client);
+	return advanced;
+}
+
+// Send `client` the recorded frames it has not acknowledged, newest first, as
+// the game's distributor (0x454D30) reads them: frameId is the newest frame,
+// group 0 is that frame, and there must be a group for every frame newer than
+// what the client last received. At most MAX_CHRSELECT_FRAMES_PER_PACKET; the
+// rest follow in the next packet.
+void Server::_sendChrSelectFrames(Client &client)
+{
+	char buffer[BUFFER_SIZE];
+	auto game = (SokuLib::PacketGame *)buffer;
+	auto &state = *client.state;
+	unsigned total = this->_chrHistory.size();
+
+	if (total <= state.chrAck)
+		return;
+
+	unsigned newest = std::min<unsigned>(total, state.chrAck + MAX_CHRSELECT_FRAMES_PER_PACKET);
+	unsigned groups = newest - state.chrAck;
+
+	this->_reportChrSelectProgress(client);
+	game->type = SokuLib::HOST_GAME;
+	game->event.type = SokuLib::GAME_INPUT;
+	game->event.input.sceneId = SokuLib::SCENEID_CHARACTER_SELECT;
+	game->event.input.frameId = newest + state.chrBase;
+	game->event.input.inputCount = groups * 4;
+	for (unsigned g = 0; g < groups; g++)
+		for (int j = 0; j < 4; j++)
+			game->event.input.inputs[g * 4 + j] = this->_chrHistory[newest - g - 1][j];
+	this->_send(client, game, sizeof(SokuLib::GameInputEvent) + sizeof(SokuLib::PacketType) + sizeof(SokuLib::Inputs) * game->event.input.inputCount);
+}
+
 // Say something when character select stops moving, and when it is moving.
 //
 // Character select is lockstep, so ONE client that stops advancing freezes all
@@ -1008,7 +1088,7 @@ void Server::_reportChrSelectProgress(Client &client)
 	if (this->_chrSelectReport.getElapsedTime().asMilliseconds() < 2000)
 		return;
 	this->_chrSelectReport.restart();
-	std::cout << "charselect:";
+	std::cout << "charselect frame " << this->_chrHistory.size() << ", acknowledged:";
 	for (int slot = 0; slot < 4; slot++) {
 		auto *player = this->_state.slots[slot];
 
@@ -1018,7 +1098,7 @@ void Server::_reportChrSelectProgress(Client &client)
 		else
 			std::cout
 				<< " " << player->client->name
-				<< " f" << ((long)player->lastFrameId - (long)player->frameIdOffset);
+				<< " f" << player->chrAck;
 	}
 	std::cout << std::endl;
 }

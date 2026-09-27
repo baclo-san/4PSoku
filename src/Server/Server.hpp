@@ -30,6 +30,7 @@
 
 extern const uint8_t versionString2v2[16];
 extern unsigned characterInputDelay;
+extern unsigned chrSelectWindow;
 
 class Server {
 private:
@@ -120,6 +121,17 @@ private:
 		GameStateStep state = JOINING;
 
 		SokuLib::Inputs getInput(unsigned frame);
+
+		// Character select, relay-clocked (see _advanceChrSelect). Frames
+		// here are the relay's: client frame = relay frame + chrBase.
+		unsigned chrBase = 0;
+		// Newest relay frame this client says it has received.
+		unsigned chrAck = 0;
+		// This client's inputs not yet placed into a frame, oldest first.
+		// One per packet, and the game sends one packet per frame it runs,
+		// so this queue is also how the relay knows the player's game is
+		// running -- and how fast.
+		std::deque<SokuLib::Inputs> chrQueue;
 	};
 
 	struct GameState {
@@ -149,6 +161,18 @@ private:
 	// Rate limit for the character-select heartbeat, which is per session
 	// rather than per client: one line every couple of seconds covers all four.
 	sf::Clock _chrSelectReport;
+	// Every character-select frame the relay has decided, as the four inputs
+	// that make it up, in slot order. Relay frame r is _chrHistory[r - 1].
+	// Every client is sent exactly these, so every client simulates the same
+	// frames -- which is all character select needs to stay in agreement.
+	std::vector<std::array<SokuLib::Inputs, 4>> _chrHistory;
+	// For the stall line: when a frame was last decided, and who held up the
+	// latest attempt. _advanceChrSelect clears the pointer on entry and the
+	// caller reads it straight after, so it never outlives its player.
+	sf::Clock _chrLastAdvance;
+	sf::Clock _chrStallReport;
+	const PlayerState *_chrBlocker = nullptr;
+	const char *_chrBlockReason = "";
 
 	void _disconnect(Client &client);
 	void _sendPeerList(Client &client);
@@ -174,6 +198,9 @@ private:
 	void _setState(Client &client, GameStateStep to);
 
 	void _handleChrSelectInput(Client &client, SokuLib::GameInputEvent &packet);
+	void _resetChrSelectClock(PlayerState &state, unsigned lastClientFrame);
+	bool _advanceChrSelect();
+	void _sendChrSelectFrames(Client &client);
 	void _reportChrSelectStall(Client &client, SokuLib::GameInputEvent &packet, const PlayerState &slowest);
 	void _reportChrSelectProgress(Client &client);
 	void _handleBattleInput(Client &client, SokuLib::GameInputEvent &packet, size_t packetSize);
