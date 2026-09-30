@@ -2182,6 +2182,23 @@ void __declspec(naked) updateOtherHud()
 
 static int skipHealthRegen = 0x47B092;
 static int dontSkipHealthRegen = 0x47B083;
+// The assist players' share of the engine's per-frame hit healing.
+//
+// Vanilla keeps this accumulator on the STACK of the collision pass: zeroed
+// when the pass starts, added to by each hit (0x47B07C), applied to HP at the
+// end (0x47D6E0), gone. This copy for P3/P4 was a static that nothing ever
+// reset. Two consequences, both bad:
+//
+//  - Once a hit had put anything in it, that player gained (or lost) the same
+//    HP again on every later frame for the rest of the session.
+//  - It is outside every savestate, so under rollback a hit simulated on a
+//    wrong guess and then rolled back still left its healing behind, and the
+//    replay added it again. How much depends on how often a machine rolled
+//    back over that hit -- different on every machine: a desync.
+//
+// addHealthRegen now clears it straight after applying it, which is the
+// vanilla lifetime exactly. It is then zero at every frame boundary, where
+// savestates are taken, so it needs no saving.
 static int extraHealing[2];
 
 void __declspec(naked) setHealthRegen()
@@ -2192,6 +2209,12 @@ void __declspec(naked) setHealthRegen()
 		MOV dword ptr [ESP + 0x20], ECX
 		CMP AL, 2
 		JLE dontSkip
+		// Two entries. An index past them used to write past the array into
+		// whatever static follows it.
+		CMP AL, 3
+		JLE inRange
+		MOV EAX, 3
+	inRange:
 		DEC EAX
 		DEC EAX
 		LEA EAX, [extraHealing + EAX * 4]
@@ -2232,6 +2255,9 @@ void __declspec(naked) addHealthRegen()
 		MOV ECX, 0
 	higherThanZero2:
 		MOV [EBX + 0x184], CX
+		// Applied: this pass's healing is spent. See extraHealing.
+		MOV dword ptr [extraHealing], 0
+		MOV dword ptr [extraHealing + 4], 0
 		RET
 	}
 }
@@ -4571,7 +4597,8 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		// 4PSoku joining this relay would play, then desync at the first heal.
 		// The relay refuses a mismatch at the door and says why.
 		// 0x97 -> 0x98: P2's deck from the match packet (takeP2DeckFromMatch).
-		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x98
+		// 0x98 -> 0x99: P3/P4 hit healing cleared per pass (extraHealing).
+		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x99
 	};
 
 	myModule = hMyModule;
