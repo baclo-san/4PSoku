@@ -355,7 +355,17 @@ static std::vector<std::array<SokuLib::Inputs, 4>> replayInputs;
 // savestate machinery runs at all. Replays are the only existing driver for
 // forcing a rollback, so proving the savestate covers P3/P4 needs them.
 static SokuLib::KeymapManager replayExtraInputs[2] = {{(void *)0x85844C, {}, {}, {}, {}, true}, {(void *)0x85844C, {}, {}, {}, {}, true}};
-static std::vector<std::array<unsigned short, 2>> sidecarInputs;
+// Every battle frame's input, indexed by rollbackState.frame: P3, P4, P1, P2.
+//
+// P3/P4 are what playback needs; the .rep has no room for them. P1/P2 ride
+// along so playback can CHECK the .rep against them -- a replay whose P1/P2
+// stream disagrees with what was actually played is wrong in a way nothing
+// else would notice until it visibly desynced.
+static std::vector<std::array<unsigned short, 4>> sidecarInputs;
+// Whether sidecarInputs holds P1/P2 too (any file of ours does; the earlier
+// last4p.dat never did).
+static bool sidecarHasP1P2 = false;
+static bool sidecarMismatchReported = false;
 // Every piece of simulation state the mod keeps OUTSIDE the game's own objects.
 //
 // Rollback netplay works by saving the whole simulation, rewinding it and
@@ -388,7 +398,6 @@ extern "C" __declspec(dllexport) void *FourPSokuRollbackState(size_t *size)
 	*size = sizeof(rollbackState);
 	return &rollbackState;
 }
-static bool sidecarLoaded = false;
 
 // KeyInput's ten signed frames-held counters -> the packed 12-bit Inputs the
 // replay/netplay path moves around.
@@ -416,43 +425,6 @@ static unsigned short packKeyInput(const SokuLib::KeyInput &k)
 	out.battle.AandB = k.changeCard > 0;
 	out.battle.BandC = k.spellcard  > 0;
 	return out.raw;
-}
-
-// One fixed path, deliberately, for now: this exists to drive giuroll's
-// rollback verifier over the most recent 2v2, not to ship replays to players.
-// Pairing a sidecar with an arbitrary .rep needs the game's replay-SAVE
-// address, which SokuLib does not expose; that is worth finding when 4P
-// replays become a user-facing feature, and is dead weight before then.
-#define SIDECAR_PATH "replay/last4p.dat"
-
-static void sidecarSave()
-{
-	if (sidecarInputs.empty())
-		return;
-
-	std::ofstream s{SIDECAR_PATH, std::ios::binary};
-
-	if (!s)
-		return;
-	s.write(reinterpret_cast<const char *>(sidecarInputs.data()), sidecarInputs.size() * sizeof(sidecarInputs[0]));
-	printf("4PSoku: wrote %zu frames of P3/P4 input to " SIDECAR_PATH "\n", sidecarInputs.size());
-}
-
-static void sidecarLoad()
-{
-	std::ifstream s{SIDECAR_PATH, std::ios::binary};
-
-	sidecarInputs.clear();
-	if (!s) {
-		printf("4PSoku: no " SIDECAR_PATH "; P3/P4 will stand still in this replay.\n");
-		return;
-	}
-
-	std::array<unsigned short, 2> e;
-
-	while (s.read(reinterpret_cast<char *>(&e), sizeof(e)))
-		sidecarInputs.push_back(e);
-	printf("4PSoku: loaded %zu frames of P3/P4 input\n", sidecarInputs.size());
 }
 
 unsigned displayInputs = 0;
@@ -560,6 +532,144 @@ static std::pair<SokuLib::PlayerInfo, SokuLib::PlayerInfo> assists = {
 	SokuLib::PlayerInfo{SokuLib::CHARACTER_CIRNO, 0, 0, 0, 0, {}, &keys.first},
 	SokuLib::PlayerInfo{SokuLib::CHARACTER_MARISA, 1, 0, 0, 0, {}, &keys.second}
 };
+
+// --- 4P replay file ----------------------------------------------------------
+//
+// One per .rep, saved beside it as "<name>.rep.4p" by the same call that saves
+// the .rep (local and netplay alike), and loaded by the same call that loads
+// it. Soku's own replay list only shows *.rep, so these never clutter it, and
+// a .rep with no .4p beside it is simply a replay without P3/P4.
+//
+// It replaces replay/last4p.dat, a single fixed file written only for local
+// versus: one replay at a time, the wrong one as soon as another match was
+// played, nothing at all for netplay -- and no P3/P4 characters or decks, so a
+// replay played after picking different assists played the wrong characters.
+//
+// Layout, little-endian:
+//   ReplayExtraHeader
+//   frames x { u16 P3, u16 P4, u16 P1, u16 P2 }   packed Inputs, as packKeyInput
+struct ReplayExtraPlayer {
+	unsigned char character;
+	unsigned char palette;
+	unsigned char deckId;
+	unsigned char deckSize;
+	unsigned short cards[20];
+};
+struct ReplayExtraHeader {
+	char magic[4];       // "4PR2"
+	uint32_t version;    // 2
+	uint32_t frames;
+	ReplayExtraPlayer players[2]; // P3, P4
+};
+static_assert(sizeof(ReplayExtraHeader) == 12 + 2 * 44);
+
+// P3/P4 as they were when this match started; what the file records.
+static ReplayExtraPlayer recordedSetup[2]{};
+
+static void snapshotSetup()
+{
+	for (int i = 0; i < 2; i++) {
+		auto &info = (&assists.first)[i];
+		auto &out = recordedSetup[i];
+
+		out = {};
+		out.character = static_cast<unsigned char>(info.character);
+		out.palette = static_cast<unsigned char>(info.palette);
+		out.deckId = info.deck;
+		out.deckSize = static_cast<unsigned char>(std::min<size_t>(info.effectiveDeck.size(), 20));
+		for (unsigned j = 0; j < out.deckSize; j++)
+			out.cards[j] = info.effectiveDeck[j];
+	}
+}
+
+static void sidecarWrite(const std::string &path)
+{
+	if (sidecarInputs.empty())
+		return;
+
+	std::ofstream s{path, std::ios::binary};
+	ReplayExtraHeader header{{'4', 'P', 'R', '2'}, 2, static_cast<uint32_t>(sidecarInputs.size()), {recordedSetup[0], recordedSetup[1]}};
+
+	if (!s) {
+		printf("4PSoku: could not write %s; this replay will have no P3/P4.\n", path.c_str());
+		return;
+	}
+	s.write(reinterpret_cast<const char *>(&header), sizeof(header));
+	s.write(reinterpret_cast<const char *>(sidecarInputs.data()), sidecarInputs.size() * sizeof(sidecarInputs[0]));
+	printf("4PSoku: wrote %zu frames of 4P replay data to %s\n", sidecarInputs.size(), path.c_str());
+}
+
+// Load the file paired with a .rep and seat P3/P4 as recorded. Runs from the
+// replay loader, before the loading scene builds the players from `assists`.
+static void sidecarRead(const std::string &path)
+{
+	std::ifstream s{path, std::ios::binary};
+	ReplayExtraHeader header;
+
+	sidecarInputs.clear();
+	sidecarHasP1P2 = false;
+	sidecarMismatchReported = false;
+	if (!s || !s.read(reinterpret_cast<char *>(&header), sizeof(header)) || memcmp(header.magic, "4PR2", 4) != 0 || header.version != 2) {
+		printf("4PSoku: no 4P data for this replay (%s); P3/P4 will stand still.\n", path.c_str());
+		return;
+	}
+	for (int i = 0; i < 2; i++) {
+		auto &info = (&assists.first)[i];
+		auto &in = header.players[i];
+
+		info.character = static_cast<SokuLib::Character>(in.character);
+		info.palette = in.palette;
+		info.deck = in.deckId;
+		info.effectiveDeck.clear();
+		for (unsigned j = 0; j < std::min<unsigned>(in.deckSize, 20); j++)
+			info.effectiveDeck.push_back(in.cards[j]);
+	}
+	// Bounded by what the header claims AND by what is there: a truncated
+	// file plays what it has.
+	sidecarInputs.reserve(std::min<uint32_t>(header.frames, 1u << 20));
+	std::array<unsigned short, 4> e;
+
+	while (sidecarInputs.size() < header.frames && s.read(reinterpret_cast<char *>(&e), sizeof(e)))
+		sidecarInputs.push_back(e);
+	sidecarHasP1P2 = true;
+	printf("4PSoku: loaded %zu frames of 4P replay data from %s\n", sidecarInputs.size(), path.c_str());
+}
+
+// The game's own std::string, as this build lays it out (VS2008): inline
+// buffer or heap pointer at +0, size at +0x10, capacity at +0x14.
+struct GameString {
+	union {
+		char buf[16];
+		char *ptr;
+	};
+	size_t size;
+	size_t capacity;
+
+	const char *c_str() const { return this->capacity >= 16 ? this->ptr : this->buf; }
+};
+
+// Replaces the two calls of the replay writer 0x42B2D0 -- local versus at
+// 0x43EC59, netplay at 0x454375. 0x42CB30 has just chosen the file name,
+// date, names and a _N suffix included, so the .4p takes exactly the same one.
+static int __fastcall saveReplayHook(void *replay, int, GameString *path)
+{
+	int ret = reinterpret_cast<int (__thiscall *)(void *, GameString *)>(0x42B2D0)(replay, path);
+
+	sidecarWrite(std::string(path->c_str()) + ".4p");
+	return ret;
+}
+
+// Replaces the one call of InputManager::readReplay (0x42EAC0) at 0x44B3F1,
+// in the replay menu.
+static bool __fastcall readReplayHook(void *inputManager, int, const char *path)
+{
+	bool ok = reinterpret_cast<bool (__thiscall *)(void *, const char *)>(0x42EAC0)(inputManager, path);
+
+	if (ok)
+		sidecarRead(std::string(path) + ".4p");
+	return ok;
+}
+
 
 void loadExtraDatFiles(const char *path)
 {
@@ -1021,22 +1131,14 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 		// start from identical state, or they are desynced before frame one.
 		rollbackState = RollbackState{};
 		warnIfGiurollTooOld();
+		// A replay keeps what its file loaded; anything else starts a new
+		// recording. Saved when the game saves the .rep, not here.
 		if (SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY) {
-			sidecarSave();
 			sidecarInputs.clear();
+			sidecarHasP1P2 = true;
+			snapshotSetup();
 		}
 		init = true;
-	}
-
-	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
-		if (!sidecarLoaded) {
-			sidecarLoad();
-			sidecarLoaded = true;
-		}
-	} else if (sidecarLoaded) {
-		// Left a replay; the next recording starts clean.
-		sidecarInputs.clear();
-		sidecarLoaded = false;
 	}
 
 	healingCircle[0].setRotation(fmod(healingCircle[0].getRotation() + 0.01, M_PI * 2));
@@ -1161,26 +1263,31 @@ static void __fastcall onSimulatedFramePost(SokuLib::BattleManager *This)
 	players[2]->score = max(players[0]->score, players[2]->score);
 	players[3]->score = max(players[1]->score, players[3]->score);
 
-	// 4P replay sidecar. keyMap now holds the input this frame was simulated
+	// 4P replay data. keyMap now holds the input this frame was simulated
 	// with, and loadExtraPlayerInputs published sidecarInputs[frame] for it on
 	// playback, so both directions use the same index. Recording writes by
 	// index rather than appending: a re-simulated frame overwrites its own
-	// entry instead of adding a duplicate. Local versus only -- four machines
-	// each writing a copy of one live match buys nothing.
-	if (
-		SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY &&
-		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSPLAYER
-	) {
+	// entry, so under rollback the last word on each frame is the confirmed
+	// one. Netplay too: every machine that saves the .rep saves this with it.
+	auto packed = [&](int i) { return packKeyInput(dataMgr->players[i]->keyMap); };
+
+	if (SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY) {
 		if (sidecarInputs.size() <= rollbackState.frame)
 			sidecarInputs.resize(rollbackState.frame + 1);
-		sidecarInputs[rollbackState.frame] = {
-			packKeyInput(dataMgr->players[2]->keyMap),
-			packKeyInput(dataMgr->players[3]->keyMap)
-		};
-		// Flushed periodically: the replay-save site is not hooked, and a
-		// crash mid-match would otherwise lose the whole recording.
-		if ((rollbackState.frame + 1) % 300 == 0)
-			sidecarSave();
+		sidecarInputs[rollbackState.frame] = {packed(2), packed(3), packed(0), packed(1)};
+	} else if (
+		sidecarHasP1P2 && !sidecarMismatchReported && rollbackState.frame < sidecarInputs.size() &&
+		(sidecarInputs[rollbackState.frame][2] != packed(0) || sidecarInputs[rollbackState.frame][3] != packed(1))
+	) {
+		// The .rep's P1/P2 are not what was played. Said once; the replay
+		// goes on, but from here it is not the match that happened.
+		sidecarMismatchReported = true;
+		printf(
+			"4PSoku: REPLAY DIVERGES at frame %u: the .rep's P1/P2 input (%04x %04x) "
+			"is not what was played (%04x %04x).\n",
+			rollbackState.frame, packed(0), packed(1),
+			sidecarInputs[rollbackState.frame][2], sidecarInputs[rollbackState.frame][3]
+		);
 	}
 	rollbackState.frame++;
 }
@@ -2207,7 +2314,11 @@ void __declspec(naked) setHealthRegen()
 		MOVSX EAX, byte ptr [ECX + 0x14E]
 		MOVSX ECX, BX
 		MOV dword ptr [ESP + 0x20], ECX
-		CMP AL, 2
+		// +0x14E is the player index, 0-3, set at battle start. The vanilla
+		// accumulator has room for P1 and P2 only. This was `CMP AL, 2`, which
+		// sent P3's healing into vanilla's array one past its end -- the field
+		// that applies to P1 when negative -- and never into extraHealing[0].
+		CMP AL, 1
 		JLE dontSkip
 		// Two entries. An index past them used to write past the array into
 		// whatever static follows it.
@@ -4598,7 +4709,8 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		// The relay refuses a mismatch at the door and says why.
 		// 0x97 -> 0x98: P2's deck from the match packet (takeP2DeckFromMatch).
 		// 0x98 -> 0x99: P3/P4 hit healing cleared per pass (extraHealing).
-		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x99
+		// 0x99 -> 0x9A: P3's hit healing goes to extraHealing[0] (index fix).
+		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x9A
 	};
 
 	myModule = hMyModule;
@@ -4971,6 +5083,10 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	new SokuLib::Trampoline(0x428789, sendCurrentSelectCharacter, 5);
 	SokuLib::TamperNearCall(0x45409A, parseExtraChrsGameMatch_hook);
 	SokuLib::TamperNearCall(0x4552E3, takeP2DeckFromMatch);
+	// 4P replays: a .4p beside every .rep the game saves or loads.
+	SokuLib::TamperNearCall(0x43EC59, saveReplayHook);
+	SokuLib::TamperNearCall(0x454375, saveReplayHook);
+	SokuLib::TamperNearCall(0x44B3F1, readReplayHook);
 	*(char *)0x45409F = 0x90;
 	og_FUNCALL43F996 = SokuLib::TamperNearJmpOpr(0x43F996, onInputsReset);
 
