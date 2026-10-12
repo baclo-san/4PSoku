@@ -356,7 +356,7 @@ static std::vector<std::array<SokuLib::Inputs, 4>> replayInputs;
 // savestate machinery runs at all. Replays are the only existing driver for
 // forcing a rollback, so proving the savestate covers P3/P4 needs them.
 static SokuLib::KeymapManager replayExtraInputs[2] = {{(void *)0x85844C, {}, {}, {}, {}, true}, {(void *)0x85844C, {}, {}, {}, {}, true}};
-// Every battle frame's input, indexed by rollbackState.frame: P3, P4, P1, P2.
+// Every battle frame's input, indexed by sidecarIndex(): P3, P4, P1, P2.
 //
 // P3/P4 are what playback needs; the .rep has no room for them. P1/P2 ride
 // along so playback can CHECK the .rep against them -- a replay whose P1/P2
@@ -425,6 +425,11 @@ static unsigned short packKeyInput(const SokuLib::KeyInput &k)
 	out.battle.dash  = k.d > 0;
 	out.battle.AandB = k.changeCard > 0;
 	out.battle.BandC = k.spellcard  > 0;
+	// The engine reads these two from inKeys as well (0x40A429, 0x40A439),
+	// and select is what switches a player's opponent in onSimulatedFramePost:
+	// a replay without it never switches, and plays a different match.
+	out.battle.pause  = k.pause  > 0;
+	out.battle.select = k.select > 0;
 	return out.raw;
 }
 
@@ -558,7 +563,12 @@ struct ReplayExtraPlayer {
 };
 struct ReplayExtraHeader {
 	char magic[4];       // "4PR2"
-	uint32_t version;    // 2
+	// 3: indexed by the game's battle frame counter (0x8985D8), raw input.
+	// 2: indexed by rollbackState.frame, which skips frames the team logic
+	//    skips, and recorded from CharacterManager::keyMap, which the engine
+	//    edits while acting on a press -- buttons go missing from it. Still
+	//    read, and played by its own index, as well as it ever played.
+	uint32_t version;
 	uint32_t frames;
 	ReplayExtraPlayer players[2]; // P3, P4
 };
@@ -583,6 +593,24 @@ static void replayLog(const char *fmt, ...)
 	started = true;
 	if (s)
 		s << line << std::endl;
+}
+
+// Which entry of sidecarInputs belongs to the frame being simulated.
+//
+// The game's battle frame counter (0x8985D8), the one the .rep and giuroll
+// number frames by, captured as each frame starts. It used to be
+// rollbackState.frame, which only advances on frames the team logic runs:
+// 20 frames behind by the end of a 2026-10-12 match, and one frame further
+// behind every time playback and the match disagreed about skipping one.
+static unsigned sidecarFrame = 0;
+static bool sidecarLegacyIndex = false;
+static unsigned battleFrameCounter()
+{
+	return *reinterpret_cast<unsigned *>(0x8985D8);
+}
+static unsigned sidecarIndex()
+{
+	return sidecarLegacyIndex ? rollbackState.frame : sidecarFrame;
 }
 
 // P3/P4 as they were when this match started; what the file records.
@@ -610,7 +638,7 @@ static void sidecarWrite(const std::string &path)
 		return;
 
 	std::ofstream s{path, std::ios::binary};
-	ReplayExtraHeader header{{'4', 'P', 'R', '2'}, 2, static_cast<uint32_t>(sidecarInputs.size()), {recordedSetup[0], recordedSetup[1]}};
+	ReplayExtraHeader header{{'4', 'P', 'R', '2'}, 3, static_cast<uint32_t>(sidecarInputs.size()), {recordedSetup[0], recordedSetup[1]}};
 
 	if (!s) {
 		replayLog("could not write %s; this replay will have no P3/P4", path.c_str());
@@ -631,10 +659,17 @@ static void sidecarRead(const std::string &path)
 	sidecarInputs.clear();
 	sidecarHasP1P2 = false;
 	sidecarMismatchReported = false;
-	if (!s || !s.read(reinterpret_cast<char *>(&header), sizeof(header)) || memcmp(header.magic, "4PR2", 4) != 0 || header.version != 2) {
+	sidecarLegacyIndex = false;
+	if (
+		!s || !s.read(reinterpret_cast<char *>(&header), sizeof(header)) || memcmp(header.magic, "4PR2", 4) != 0 ||
+		(header.version != 2 && header.version != 3)
+	) {
 		replayLog("no 4P data for this replay (%s); P3/P4 will stand still", path.c_str());
 		return;
 	}
+	sidecarLegacyIndex = header.version == 2;
+	if (sidecarLegacyIndex)
+		replayLog("%s is from an older 4PSoku: its P3/P4 input has gaps, so this replay will drift from the match", path.c_str());
 	for (int i = 0; i < 2; i++) {
 		auto &info = (&assists.first)[i];
 		auto &in = header.players[i];
@@ -1211,13 +1246,15 @@ static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
 {
 	// Replay: P3/P4's input for THIS frame, before the engine polls it. This
 	// used to be set once, by match setup, which a replay does not even run --
-	// so playback held one input for the whole match. rollbackState.frame is
-	// rewound with everything else, so seeking backwards stays in step.
+	// so playback held one input for the whole match. The battle frame counter
+	// is rewound with everything else, so seeking backwards stays in step.
+	sidecarFrame = battleFrameCounter();
 	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
-		bool have = rollbackState.frame < sidecarInputs.size();
+		unsigned at = sidecarIndex();
+		bool have = at < sidecarInputs.size();
 
-		replayExtraInputs[0].inKeys.raw = have ? sidecarInputs[rollbackState.frame][0] : 0;
-		replayExtraInputs[1].inKeys.raw = have ? sidecarInputs[rollbackState.frame][1] : 0;
+		replayExtraInputs[0].inKeys.raw = have ? sidecarInputs[at][0] : 0;
+		replayExtraInputs[1].inKeys.raw = have ? sidecarInputs[at][1] : 0;
 		keys.first.keymapManager = &replayExtraInputs[0];
 		keys.second.keymapManager = &replayExtraInputs[1];
 	}
@@ -1251,10 +1288,72 @@ static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
 // machine alone stopped merging the pairs' state -- a desync from a key nobody
 // would suspect. In local play the engine does not simulate while paused, so
 // this is simply not reached then.
+// 4P replay data for the frame just simulated.
+static void replayFramePost()
+{
+	// Each player's RAW input this frame: the KeymapManager's counters, which
+	// the engine reads from (and giuroll writes online). Not
+	// CharacterManager::keyMap -- the engine edits that copy while acting on a
+	// press, so buttons went missing from every replay recorded from it (P4's
+	// B on frames 149-155 of a 2026-10-12 match), and playback diverged from
+	// the first one that mattered.
+	auto packed = [&](int i) -> unsigned short {
+		auto km = dataMgr->players[i]->keyManager ? dataMgr->players[i]->keyManager->keymapManager : nullptr;
+
+		return km ? packKeyInput(km->input) : 0;
+	};
+	unsigned at = sidecarIndex();
+
+	// Recording writes by index rather than appending: a re-simulated frame
+	// overwrites its own entry, so under rollback the last word on each frame
+	// is the confirmed one. Netplay too: every machine that saves the .rep
+	// saves this with it.
+	if (SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY) {
+		if (sidecarInputs.size() <= at)
+			sidecarInputs.resize(at + 1);
+		sidecarInputs[at] = {packed(2), packed(3), packed(0), packed(1)};
+		return;
+	}
+	if (at % 120 == 0) {
+		// Who reads what during playback, every two seconds. KeymapManager:
+		// inKeys at +0x60 is what the engine copies replay input into,
+		// readInKeys at +0x64 decides whether the update uses it.
+		char line[256];
+		int n = snprintf(line, sizeof(line), "replay frame %u:", at);
+
+		for (int i = 0; i < 4 && n > 0 && n < (int)sizeof(line); i++) {
+			auto km = dataMgr->players[i]->keyManager ? dataMgr->players[i]->keyManager->keymapManager : nullptr;
+
+			n += snprintf(
+				line + n, sizeof(line) - n, "  P%d mgr %p readIn %d in %04x used %04x",
+				i + 1, (void *)km, km ? *((unsigned char *)km + 0x64) : -1,
+				km ? *(unsigned short *)((char *)km + 0x60) : 0, packed(i)
+			);
+		}
+		replayLog("%s", line);
+	}
+	if (
+		sidecarHasP1P2 && !sidecarMismatchReported && at < sidecarInputs.size() &&
+		(sidecarInputs[at][2] != packed(0) || sidecarInputs[at][3] != packed(1))
+	) {
+		// What the .rep fed P1/P2 is not what the .4p says they played. Said
+		// once; the replay goes on, but from here it is not the match that
+		// happened.
+		sidecarMismatchReported = true;
+		replayLog(
+			"REPLAY DIVERGES at frame %u: P1/P2 played (%04x %04x), the match had (%04x %04x)",
+			at, packed(0), packed(1), sidecarInputs[at][2], sidecarInputs[at][3]
+		);
+	}
+}
+
 static void __fastcall onSimulatedFramePost(SokuLib::BattleManager *This)
 {
 	auto players = (SokuLib::CharacterManager**)((int)This + 0x0C);
 
+	// Before the skip: a frame the team logic skips is still a frame the
+	// engine simulated with input, and the replay needs that input.
+	replayFramePost();
 	if (frameSkipped)
 		return;
 
@@ -1304,51 +1403,6 @@ static void __fastcall onSimulatedFramePost(SokuLib::BattleManager *This)
 	players[2]->score = max(players[0]->score, players[2]->score);
 	players[3]->score = max(players[1]->score, players[3]->score);
 
-	// 4P replay data. keyMap now holds the input this frame was simulated
-	// with, and loadExtraPlayerInputs published sidecarInputs[frame] for it on
-	// playback, so both directions use the same index. Recording writes by
-	// index rather than appending: a re-simulated frame overwrites its own
-	// entry, so under rollback the last word on each frame is the confirmed
-	// one. Netplay too: every machine that saves the .rep saves this with it.
-	auto packed = [&](int i) { return packKeyInput(dataMgr->players[i]->keyMap); };
-
-	if (SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY) {
-		if (sidecarInputs.size() <= rollbackState.frame)
-			sidecarInputs.resize(rollbackState.frame + 1);
-		sidecarInputs[rollbackState.frame] = {packed(2), packed(3), packed(0), packed(1)};
-	} else if (rollbackState.frame % 120 == 0) {
-		// Who reads what during playback, every two seconds. KeymapManager:
-		// inKeys at +0x60 is what the engine copies replay input into
-		// (0x482216), readInKeys at +0x64 decides whether the update uses it.
-		char line[256];
-		int n = snprintf(line, sizeof(line), "replay frame %u:", rollbackState.frame);
-
-		for (int i = 0; i < 4 && n > 0 && n < (int)sizeof(line); i++) {
-			auto km = dataMgr->players[i]->keyManager ? dataMgr->players[i]->keyManager->keymapManager : nullptr;
-
-			n += snprintf(
-				line + n, sizeof(line) - n, "  P%d mgr %p readIn %d in %04x used %04x",
-				i + 1, (void *)km, km ? *((unsigned char *)km + 0x64) : -1,
-				km ? *(unsigned short *)((char *)km + 0x60) : 0, packed(i)
-			);
-		}
-		replayLog("%s", line);
-	}
-	if (
-		SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY &&
-		sidecarHasP1P2 && !sidecarMismatchReported && rollbackState.frame < sidecarInputs.size() &&
-		(sidecarInputs[rollbackState.frame][2] != packed(0) || sidecarInputs[rollbackState.frame][3] != packed(1))
-	) {
-		// The .rep's P1/P2 are not what was played. Said once; the replay
-		// goes on, but from here it is not the match that happened.
-		sidecarMismatchReported = true;
-		replayLog(
-			"REPLAY DIVERGES at frame %u: the .rep's P1/P2 input (%04x %04x) "
-			"is not what was played (%04x %04x)",
-			rollbackState.frame, packed(0), packed(1),
-			sidecarInputs[rollbackState.frame][2], sidecarInputs[rollbackState.frame][3]
-		);
-	}
 	rollbackState.frame++;
 }
 
@@ -2201,9 +2255,10 @@ int loadExtraPlayerInputs()
 	// why 4P replays never worked, and why they failed by diverging rather
 	// than by crashing.
 	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
-		if (rollbackState.frame < sidecarInputs.size()) {
-			replayExtraInputs[0].inKeys.raw = sidecarInputs[rollbackState.frame][0];
-			replayExtraInputs[1].inKeys.raw = sidecarInputs[rollbackState.frame][1];
+		sidecarFrame = battleFrameCounter();
+		if (sidecarIndex() < sidecarInputs.size()) {
+			replayExtraInputs[0].inKeys.raw = sidecarInputs[sidecarIndex()][0];
+			replayExtraInputs[1].inKeys.raw = sidecarInputs[sidecarIndex()][1];
 		} else {
 			// Ran past the sidecar: hold neutral rather than repeat the last
 			// input forever, which would look like a stuck stick.
