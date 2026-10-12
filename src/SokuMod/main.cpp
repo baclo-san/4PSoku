@@ -4849,6 +4849,15 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 
 	// Enable 4 characters inputs
 	*(char *)0x48219D = 0x4;
+	// That 2 was also the vanilla code's REPLAY submode: the same EBX is
+	// compared with subMode at 0x4821A1, which gates the call that feeds a
+	// replay's P1/P2 input into their KeymapManagers (0x42ADB0), and at
+	// 0x482264, which keeps the pause menu shut during replays. With EBX = 4
+	// neither ever matched -- every replay played P1/P2 standing still. Both
+	// compare with an immediate 2 now (CMP EAX,EBX -> CMP AL,2, same length);
+	// EBX stays 4 for the pause-key loop that follows.
+	*(unsigned short *)0x4821A1 = 0x023C;
+	*(unsigned short *)0x482264 = 0x023C;
 	// Disable inputs for all 4 characters in transitions
 	*(char *)0x479714 = 0x4;
 
