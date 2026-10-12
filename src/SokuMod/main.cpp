@@ -4,6 +4,7 @@
 
 #define _USE_MATH_DEFINES
 
+#include <cstdarg>
 #include <fstream>
 #include <sstream>
 #include <optional>
@@ -563,6 +564,27 @@ struct ReplayExtraHeader {
 };
 static_assert(sizeof(ReplayExtraHeader) == 12 + 2 * 44);
 
+// 4psoku-replay.log, beside the game. printf from this DLL reaches no console
+// a player can see -- giuroll's console belongs to giuroll's CRT -- so every
+// message the replay code printed so far was lost, including the ones that
+// would have said why the first 4P replay played wrong.
+static void replayLog(const char *fmt, ...)
+{
+	static bool started = false;
+	char line[512];
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(line, sizeof(line), fmt, args);
+	va_end(args);
+
+	std::ofstream s{"4psoku-replay.log", started ? std::ios::app : std::ios::trunc};
+
+	started = true;
+	if (s)
+		s << line << std::endl;
+}
+
 // P3/P4 as they were when this match started; what the file records.
 static ReplayExtraPlayer recordedSetup[2]{};
 
@@ -591,12 +613,12 @@ static void sidecarWrite(const std::string &path)
 	ReplayExtraHeader header{{'4', 'P', 'R', '2'}, 2, static_cast<uint32_t>(sidecarInputs.size()), {recordedSetup[0], recordedSetup[1]}};
 
 	if (!s) {
-		printf("4PSoku: could not write %s; this replay will have no P3/P4.\n", path.c_str());
+		replayLog("could not write %s; this replay will have no P3/P4", path.c_str());
 		return;
 	}
 	s.write(reinterpret_cast<const char *>(&header), sizeof(header));
 	s.write(reinterpret_cast<const char *>(sidecarInputs.data()), sidecarInputs.size() * sizeof(sidecarInputs[0]));
-	printf("4PSoku: wrote %zu frames of 4P replay data to %s\n", sidecarInputs.size(), path.c_str());
+	replayLog("wrote %zu frames of 4P replay data to %s", sidecarInputs.size(), path.c_str());
 }
 
 // Load the file paired with a .rep and seat P3/P4 as recorded. Runs from the
@@ -610,7 +632,7 @@ static void sidecarRead(const std::string &path)
 	sidecarHasP1P2 = false;
 	sidecarMismatchReported = false;
 	if (!s || !s.read(reinterpret_cast<char *>(&header), sizeof(header)) || memcmp(header.magic, "4PR2", 4) != 0 || header.version != 2) {
-		printf("4PSoku: no 4P data for this replay (%s); P3/P4 will stand still.\n", path.c_str());
+		replayLog("no 4P data for this replay (%s); P3/P4 will stand still", path.c_str());
 		return;
 	}
 	for (int i = 0; i < 2; i++) {
@@ -632,12 +654,21 @@ static void sidecarRead(const std::string &path)
 	while (sidecarInputs.size() < header.frames && s.read(reinterpret_cast<char *>(&e), sizeof(e)))
 		sidecarInputs.push_back(e);
 	sidecarHasP1P2 = true;
-	printf("4PSoku: loaded %zu frames of 4P replay data from %s\n", sidecarInputs.size(), path.c_str());
+	replayLog(
+		"loaded %zu frames of 4P replay data from %s; P3 character %d, P4 character %d",
+		sidecarInputs.size(), path.c_str(), header.players[0].character, header.players[1].character
+	);
 }
 
-// The game's own std::string, as this build lays it out (VS2008): inline
-// buffer or heap pointer at +0, size at +0x10, capacity at +0x14.
+// The game's own std::string, as VS2008 lays it out: the allocator first (a
+// 4-byte slot), then the inline buffer or heap pointer, size, capacity. Read
+// off 0x42CB30, where one string's object is at esp+0x50, its buffer at
+// +0x54 and its capacity at +0x68. Without the allocator slot this read the
+// size as the capacity and the allocator as the text pointer: the first 4P
+// replay's file went to a garbage path, and P3/P4 played as whoever was
+// picked last.
 struct GameString {
+	uint32_t allocator;
 	union {
 		char buf[16];
 		char *ptr;
@@ -665,8 +696,15 @@ static bool __fastcall readReplayHook(void *inputManager, int, const char *path)
 {
 	bool ok = reinterpret_cast<bool (__thiscall *)(void *, const char *)>(0x42EAC0)(inputManager, path);
 
-	if (ok)
+	if (ok) {
 		sidecarRead(std::string(path) + ".4p");
+		// The setup that would otherwise do this (loadExtraPlayerInputs, from
+		// 0x43EEF0) is the LIVE match setup -- it builds decks from profiles --
+		// and a replay never runs it. So P3/P4 kept the controllers of the
+		// last local match: playable during the replay.
+		keys.first.keymapManager = &replayExtraInputs[0];
+		keys.second.keymapManager = &replayExtraInputs[1];
+	}
 	return ok;
 }
 
@@ -1131,6 +1169,10 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 		// start from identical state, or they are desynced before frame one.
 		rollbackState = RollbackState{};
 		warnIfGiurollTooOld();
+		replayLog(
+			"battle start: mainMode %d subMode %d, %zu frames of 4P replay data held",
+			SokuLib::mainMode, SokuLib::subMode, sidecarInputs.size()
+		);
 		// A replay keeps what its file loaded; anything else starts a new
 		// recording. Saved when the game saves the .rep, not here.
 		if (SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY) {
@@ -1180,6 +1222,18 @@ static bool frameSkipped = false;
 // Before the engine simulates a frame.
 static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
 {
+	// Replay: P3/P4's input for THIS frame, before the engine polls it. This
+	// used to be set once, by match setup, which a replay does not even run --
+	// so playback held one input for the whole match. rollbackState.frame is
+	// rewound with everything else, so seeking backwards stays in step.
+	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
+		bool have = rollbackState.frame < sidecarInputs.size();
+
+		replayExtraInputs[0].inKeys.raw = have ? sidecarInputs[rollbackState.frame][0] : 0;
+		replayExtraInputs[1].inKeys.raw = have ? sidecarInputs[rollbackState.frame][1] : 0;
+		keys.first.keymapManager = &replayExtraInputs[0];
+		keys.second.keymapManager = &replayExtraInputs[1];
+	}
 	frameSkipped = This->matchState == -1;
 	for (auto &player : dataMgr->players)
 		if (!frameSkipped && player->keyMap.pause == 1)
@@ -1282,9 +1336,9 @@ static void __fastcall onSimulatedFramePost(SokuLib::BattleManager *This)
 		// The .rep's P1/P2 are not what was played. Said once; the replay
 		// goes on, but from here it is not the match that happened.
 		sidecarMismatchReported = true;
-		printf(
-			"4PSoku: REPLAY DIVERGES at frame %u: the .rep's P1/P2 input (%04x %04x) "
-			"is not what was played (%04x %04x).\n",
+		replayLog(
+			"REPLAY DIVERGES at frame %u: the .rep's P1/P2 input (%04x %04x) "
+			"is not what was played (%04x %04x)",
 			rollbackState.frame, packed(0), packed(1),
 			sidecarInputs[rollbackState.frame][2], sidecarInputs[rollbackState.frame][3]
 		);
