@@ -660,33 +660,20 @@ static void sidecarRead(const std::string &path)
 	);
 }
 
-// The game's own std::string, as VS2008 lays it out: the allocator first (a
-// 4-byte slot), then the inline buffer or heap pointer, size, capacity. Read
-// off 0x42CB30, where one string's object is at esp+0x50, its buffer at
-// +0x54 and its capacity at +0x68. Without the allocator slot this read the
-// size as the capacity and the allocator as the text pointer: the first 4P
-// replay's file went to a garbage path, and P3/P4 played as whoever was
-// picked last.
-struct GameString {
-	uint32_t allocator;
-	union {
-		char buf[16];
-		char *ptr;
-	};
-	size_t size;
-	size_t capacity;
-
-	const char *c_str() const { return this->capacity >= 16 ? this->ptr : this->buf; }
-};
-
 // Replaces the two calls of the replay writer 0x42B2D0 -- local versus at
-// 0x43EC59, netplay at 0x454375. 0x42CB30 has just chosen the file name,
-// date, names and a _N suffix included, so the .4p takes exactly the same one.
-static int __fastcall saveReplayHook(void *replay, int, GameString *path)
+// 0x43EC59, netplay at 0x454375. 0x42CB30 has just written the file name,
+// date, names and a _N suffix included, into a plain char buffer on the
+// caller's stack (char[0x104] at 0x43EC59), and that buffer is the argument:
+// not a std::string. Reading it as one took the text for a pointer -- the
+// crash at match end of 2026-10-12, reading 0x535C7961, which is "ay\S" of
+// "replay\S...". Whatever names the file (a replay-folder mod included), the
+// .4p takes exactly the same name.
+static int __fastcall saveReplayHook(void *replay, int, const char *path)
 {
-	int ret = reinterpret_cast<int (__thiscall *)(void *, GameString *)>(0x42B2D0)(replay, path);
+	int ret = reinterpret_cast<int (__thiscall *)(void *, const char *)>(0x42B2D0)(replay, path);
 
-	sidecarWrite(std::string(path->c_str()) + ".4p");
+	if (path && *path)
+		sidecarWrite(std::string(path) + ".4p");
 	return ret;
 }
 
@@ -1329,7 +1316,26 @@ static void __fastcall onSimulatedFramePost(SokuLib::BattleManager *This)
 		if (sidecarInputs.size() <= rollbackState.frame)
 			sidecarInputs.resize(rollbackState.frame + 1);
 		sidecarInputs[rollbackState.frame] = {packed(2), packed(3), packed(0), packed(1)};
-	} else if (
+	} else if (rollbackState.frame % 120 == 0) {
+		// Who reads what during playback, every two seconds. KeymapManager:
+		// inKeys at +0x60 is what the engine copies replay input into
+		// (0x482216), readInKeys at +0x64 decides whether the update uses it.
+		char line[256];
+		int n = snprintf(line, sizeof(line), "replay frame %u:", rollbackState.frame);
+
+		for (int i = 0; i < 4 && n > 0 && n < (int)sizeof(line); i++) {
+			auto km = dataMgr->players[i]->keyManager ? dataMgr->players[i]->keyManager->keymapManager : nullptr;
+
+			n += snprintf(
+				line + n, sizeof(line) - n, "  P%d mgr %p readIn %d in %04x used %04x",
+				i + 1, (void *)km, km ? *((unsigned char *)km + 0x64) : -1,
+				km ? *(unsigned short *)((char *)km + 0x60) : 0, packed(i)
+			);
+		}
+		replayLog("%s", line);
+	}
+	if (
+		SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY &&
 		sidecarHasP1P2 && !sidecarMismatchReported && rollbackState.frame < sidecarInputs.size() &&
 		(sidecarInputs[rollbackState.frame][2] != packed(0) || sidecarInputs[rollbackState.frame][3] != packed(1))
 	) {
