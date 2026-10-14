@@ -1257,6 +1257,19 @@ static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
 		replayExtraInputs[1].inKeys.raw = have ? sidecarInputs[at][1] : 0;
 		keys.first.keymapManager = &replayExtraInputs[0];
 		keys.second.keymapManager = &replayExtraInputs[1];
+		// P1/P2 from the .4p as well, over what the game just fed them from
+		// the .rep (0x4821AC, before this loop). The .rep does not keep the
+		// select bit -- harmless in 1v1, but in 2v2 select switches a
+		// player's opponent, so a 2026-10-12 replay drifted at frame 738,
+		// seven frames after P1 switched. A version-2 .4p has P1/P2 from the
+		// edited keyMap copy, worse than the .rep, so those keep the .rep.
+		if (have && !sidecarLegacyIndex)
+			for (int i = 0; i < 2; i++) {
+				auto km = dataMgr->players[i]->keyManager ? dataMgr->players[i]->keyManager->keymapManager : nullptr;
+
+				if (km)
+					km->inKeys.raw = sidecarInputs[at][2 + i];
+			}
 	}
 	frameSkipped = This->matchState == -1;
 	for (auto &player : dataMgr->players)
@@ -1336,9 +1349,9 @@ static void replayFramePost()
 		sidecarHasP1P2 && !sidecarMismatchReported && at < sidecarInputs.size() &&
 		(sidecarInputs[at][2] != packed(0) || sidecarInputs[at][3] != packed(1))
 	) {
-		// What the .rep fed P1/P2 is not what the .4p says they played. Said
-		// once; the replay goes on, but from here it is not the match that
-		// happened.
+		// P1/P2 did not play what the .4p says they did: fed from the .rep
+		// (a version-2 file), or the feed above did not take. Said once; the
+		// replay goes on, but from here it is not the match that happened.
 		sidecarMismatchReported = true;
 		replayLog(
 			"REPLAY DIVERGES at frame %u: P1/P2 played (%04x %04x), the match had (%04x %04x)",
