@@ -570,6 +570,9 @@ static void replayLog(const char *fmt, ...)
 	vsnprintf(line, sizeof(line), fmt, args);
 	va_end(args);
 
+	// The spectator's packet handlers log from the network thread.
+	static std::mutex mutex;
+	std::lock_guard<std::mutex> lock(mutex);
 	std::ofstream s{"4psoku-replay.log", started ? std::ios::app : std::ios::trunc};
 
 	started = true;
@@ -1458,10 +1461,57 @@ static void spectatorReportWait(const char *why, unsigned have, unsigned next, b
 	);
 }
 
+// Diagnostics for the watch flow, which is the game's own and only partly
+// mapped. The client net object's state byte (+0x6C) drives it: the watch
+// loading scene sets 3 when it opens and its take-match (0x455340) sets 5; a
+// battle that finds 3 goes back to loading. Who sets 3 says why: 0x4541AE a
+// GAME_REPLAY for another match, 0x454AD0 the match's inputs are over,
+// 0x4551E9 a GAME_MATCH for a new match, 0x428DB0 the loading scene opening.
+static void (__thiscall *ogNetSetState)(void *, char);
+
+static void __fastcall netSetState(char *net, int, char state)
+{
+	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSWATCH && net[0x6C] != state)
+		replayLog(
+			"spectating: net state %d -> %d from %p, scene %d, match %d",
+			net[0x6C], state, _ReturnAddress(), SokuLib::sceneId, (unsigned char)net[0x6C0]
+		);
+	ogNetSetState(net, state);
+}
+
+// The game's GAME_REPLAY handler, called at 0x455012 with the decoded packet:
+// +8 inputs held after it, +0xC end of the match's inputs, +0x10 match id.
+static int spectatorReplayLoggedMatch = -1;
+
+static void __fastcall onSpectatorGameReplay(char *net, int, char *ev)
+{
+	unsigned char match = ev[0x10];
+	unsigned char watched = net[0x6C0];
+
+	if (match != watched || spectatorReplayLoggedMatch != match) {
+		spectatorReplayLoggedMatch = match;
+		replayLog(
+			"spectating: GAME_REPLAY for match %d (watching %d), %u inputs held after it, end %u, scene %d",
+			match, watched, *(unsigned *)(ev + 8), *(unsigned *)(ev + 0xC), SokuLib::sceneId
+		);
+	}
+	reinterpret_cast<void (__thiscall *)(void *, void *)>(0x454190)(net, ev);
+}
+
+static int spectatorLastAskScene = -1;
+
 static bool __fastcall spectatorCanAdvance(void *net, int)
 {
 	bool vanilla = ogSpectatorCanAdvance(net);
 	bool firstOfTick = _ReturnAddress() == reinterpret_cast<void *>(0x4288B1);
+
+	if (spectatorLastAskScene != SokuLib::sceneId) {
+		spectatorLastAskScene = SokuLib::sceneId;
+		replayLog(
+			"spectating: asked whether to advance in scene %d, mode %d, from %p, game says %d",
+			SokuLib::sceneId, SokuLib::mainMode, _ReturnAddress(), vanilla
+		);
+	}
 
 	if (SokuLib::mainMode != SokuLib::BATTLE_MODE_VSWATCH)
 		return vanilla;
@@ -2663,6 +2713,10 @@ const double yPos = 62;
 
 int __fastcall onHudRender(CInfoManager *This)
 {
+	// Before the battle's first frame (a spectator's battle can be drawn
+	// while it waits for input) P3/P4 and hud2 are not set up for it.
+	if (!init || !dataMgr->players[2] || !dataMgr->players[3])
+		return s_ogHudRender(This);
 	setRenderMode(2);
 	for (int i = 0; i < 2; i++) {
 		auto &h = (&rollbackState.healing.first)[i];
@@ -5196,6 +5250,9 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	s_ogHudRender = (int (__thiscall *)(void *))SokuLib::TamperDword(0x85b544, onHudRender);
 	memcpy((void *)0x858B80, versionString2v2, sizeof(versionString2v2));
 	// The client net object's vtable, in .rdata: see spectatorCanAdvance.
+	ogNetSetState = reinterpret_cast<void (__thiscall *)(void *, char)>(
+		SokuLib::TamperDword(0x858D40, netSetState)
+	);
 	ogSpectatorCanAdvance = reinterpret_cast<bool (__thiscall *)(void *)>(
 		SokuLib::TamperDword(0x858D38, spectatorCanAdvance)
 	);
@@ -5551,6 +5608,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	*(unsigned char *)0x41DB06 = 0x0F;
 	*(DWORD *)0x41E028 = 0x41DFC2;
 	*(void **)0x41E02C = handleSpectatorInputsPacket_hook;
+	SokuLib::TamperNearCall(0x455012, onSpectatorGameReplay);
 	static_assert(SPECTATOR_INPUTS == 16);
 
 	new SokuLib::Trampoline(0x428789, sendCurrentSelectCharacter, 5);
