@@ -26,6 +26,7 @@
 # include <SFML/Network.hpp>
 #endif
 #include <CustomPackets.hpp>
+#include <Replay4P.hpp>
 #include "Packet.hpp"
 
 extern const uint8_t versionString2v2[16];
@@ -212,6 +213,34 @@ private:
 
 	void _onPlayerDisconnect(size_t index);
 
+	// --- Spectators ---------------------------------------------------------
+	//
+	// What spectators are shown: one match's setup, as the GAME_MATCH packet
+	// they load it from, and its confirmed input by battle frame, P1..P4.
+	// `available` frames of it may be sent; in broadcast mode the rest are
+	// held back to play out in real time.
+	struct SpectatorFeed {
+		bool active = false;
+		unsigned char matchId = 0;
+		std::vector<uint8_t> matchPacket;
+		std::vector<std::array<uint16_t, 4>> frames;
+		size_t available = 0;
+		bool ended = false;
+		char names[4][32] = {};
+	};
+	SpectatorFeed _feed;
+	// Broadcast mode: one recorded match, released at 60 frames a second from
+	// the first spectator's arrival, and replayed as a new match after it ends.
+	bool _broadcast = false;
+	bool _broadcastStarted = false;
+	sf::Clock _broadcastClock;
+
+	void _updateBroadcast();
+	void _handleSpectatorJoin(Client &client, SokuLib::PacketInitRequ &packet);
+	void _handleSpectatorGame(Client &client, SokuLib::PacketGame &packet, size_t packetSize);
+	void _handlePacket(Client &client, PacketSpectatorRequest &packet, size_t packetSize);
+	void _sendReplayToSpectator(Client &client, SokuLib::GameReplayRequestEvent &packet);
+
 	void _send(Client &client, void *data, size_t size);
 
 	bool allSlotsFilled() const;
@@ -232,6 +261,8 @@ private:
 public:
 	Server(unsigned short port);
 	void update();
+	// Serve the match in a .rep.4p (version 4) to spectators, as if live.
+	void loadBroadcast(const std::string &path);
 };
 
 

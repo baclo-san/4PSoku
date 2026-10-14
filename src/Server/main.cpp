@@ -122,8 +122,20 @@ namespace SokuLib {
 
 int main(int argc, char **argv)
 {
+	// --broadcast <file.rep.4p>, anywhere: serve that recorded match to
+	// spectators instead of hosting players. For testing spectating alone.
+	std::string broadcast;
+
+	for (int i = 1; i < argc; i++)
+		if (std::string(argv[i]) == "--broadcast" && i + 1 < argc) {
+			broadcast = argv[i + 1];
+			for (int j = i; j + 2 <= argc; j++)
+				argv[j] = argv[j + 2];
+			argc -= 2;
+			break;
+		}
 	if (argc < 2 || argc > 4) {
-		std::cerr << "Usage: " << argv[0] << " <port> [poll_interval_us=1000] [chrselect_window_frames=20]" << std::endl;
+		std::cerr << "Usage: " << argv[0] << " <port> [poll_interval_us=1000] [chrselect_window_frames=20] [--broadcast <replay.rep.4p>]" << std::endl;
 		return EXIT_FAILURE;
 	}
 
@@ -162,6 +174,9 @@ int main(int argc, char **argv)
 			throw std::invalid_argument("Invalid port");
 
 		Server server{static_cast<unsigned short>(port)};
+
+		if (!broadcast.empty())
+			server.loadBroadcast(broadcast);
 
 		while (true) {
 			server.update();

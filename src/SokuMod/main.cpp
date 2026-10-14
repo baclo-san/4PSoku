@@ -14,7 +14,10 @@
 #include <shlwapi.h>
 #include <thread>
 #include <deque>
+#include <mutex>
+#include <intrin.h>
 #include "CustomPackets.hpp"
+#include "Replay4P.hpp"
 
 #ifndef _DEBUG
 #define puts(...)
@@ -551,28 +554,7 @@ static std::pair<SokuLib::PlayerInfo, SokuLib::PlayerInfo> assists = {
 // played, nothing at all for netplay -- and no P3/P4 characters or decks, so a
 // replay played after picking different assists played the wrong characters.
 //
-// Layout, little-endian:
-//   ReplayExtraHeader
-//   frames x { u16 P3, u16 P4, u16 P1, u16 P2 }   packed Inputs, as packKeyInput
-struct ReplayExtraPlayer {
-	unsigned char character;
-	unsigned char palette;
-	unsigned char deckId;
-	unsigned char deckSize;
-	unsigned short cards[20];
-};
-struct ReplayExtraHeader {
-	char magic[4];       // "4PR2"
-	// 3: indexed by the game's battle frame counter (0x8985D8), raw input.
-	// 2: indexed by rollbackState.frame, which skips frames the team logic
-	//    skips, and recorded from CharacterManager::keyMap, which the engine
-	//    edits while acting on a press -- buttons go missing from it. Still
-	//    read, and played by its own index, as well as it ever played.
-	uint32_t version;
-	uint32_t frames;
-	ReplayExtraPlayer players[2]; // P3, P4
-};
-static_assert(sizeof(ReplayExtraHeader) == 12 + 2 * 44);
+// Layout and versions: Replay4P.hpp, shared with the relay.
 
 // 4psoku-replay.log, beside the game. printf from this DLL reaches no console
 // a player can see -- giuroll's console belongs to giuroll's CRT -- so every
@@ -613,23 +595,44 @@ static unsigned sidecarIndex()
 	return sidecarLegacyIndex ? rollbackState.frame : sidecarFrame;
 }
 
-// P3/P4 as they were when this match started; what the file records.
+// The match as it was when it started; what the file records. P3/P4 in
+// recordedSetup, everything else in recordedMatch.
 static ReplayExtraPlayer recordedSetup[2]{};
+static ReplaySetup recordedMatch{};
+
+static void snapshotPlayer(SokuLib::PlayerInfo &info, ReplayExtraPlayer &out)
+{
+	out = {};
+	out.character = static_cast<unsigned char>(info.character);
+	out.palette = static_cast<unsigned char>(info.palette);
+	out.deckId = info.deck;
+	out.deckSize = static_cast<unsigned char>(std::min<size_t>(info.effectiveDeck.size(), 20));
+	for (unsigned j = 0; j < out.deckSize; j++)
+		out.cards[j] = info.effectiveDeck[j];
+}
 
 static void snapshotSetup()
 {
-	for (int i = 0; i < 2; i++) {
-		auto &info = (&assists.first)[i];
-		auto &out = recordedSetup[i];
-
-		out = {};
-		out.character = static_cast<unsigned char>(info.character);
-		out.palette = static_cast<unsigned char>(info.palette);
-		out.deckId = info.deck;
-		out.deckSize = static_cast<unsigned char>(std::min<size_t>(info.effectiveDeck.size(), 20));
-		for (unsigned j = 0; j < out.deckSize; j++)
-			out.cards[j] = info.effectiveDeck[j];
-	}
+	snapshotPlayer(assists.first, recordedSetup[0]);
+	snapshotPlayer(assists.second, recordedSetup[1]);
+	snapshotPlayer(SokuLib::gameParams.leftPlayerInfo, recordedMatch.players[0]);
+	snapshotPlayer(SokuLib::gameParams.rightPlayerInfo, recordedMatch.players[1]);
+	recordedMatch.stage = SokuLib::gameParams.stageId;
+	recordedMatch.music = SokuLib::gameParams.musicId;
+	recordedMatch.seed = SokuLib::gameParams.randomSeed;
+	// The profiles' flags: right for a local match, which is what a broadcast
+	// test records. The engine reads the packed A+B / B+C bits of a replay's
+	// input directly, so playback does not depend on them.
+	for (int i = 0; i < 4; i++)
+		recordedMatch.disabledSimul[i] = profiles[i]->hasSimulButtonsOff;
+	replayLog(
+		"match setup: characters %d %d %d %d, deck sizes %d %d %d %d, stage %d, seed %08x",
+		recordedMatch.players[0].character, recordedMatch.players[1].character,
+		recordedSetup[0].character, recordedSetup[1].character,
+		recordedMatch.players[0].deckSize, recordedMatch.players[1].deckSize,
+		recordedSetup[0].deckSize, recordedSetup[1].deckSize,
+		recordedMatch.stage, recordedMatch.seed
+	);
 }
 
 static void sidecarWrite(const std::string &path)
@@ -638,13 +641,14 @@ static void sidecarWrite(const std::string &path)
 		return;
 
 	std::ofstream s{path, std::ios::binary};
-	ReplayExtraHeader header{{'4', 'P', 'R', '2'}, 3, static_cast<uint32_t>(sidecarInputs.size()), {recordedSetup[0], recordedSetup[1]}};
+	ReplayExtraHeader header{{'4', 'P', 'R', '2'}, REPLAY4P_VERSION, static_cast<uint32_t>(sidecarInputs.size()), {recordedSetup[0], recordedSetup[1]}};
 
 	if (!s) {
 		replayLog("could not write %s; this replay will have no P3/P4", path.c_str());
 		return;
 	}
 	s.write(reinterpret_cast<const char *>(&header), sizeof(header));
+	s.write(reinterpret_cast<const char *>(&recordedMatch), sizeof(recordedMatch));
 	s.write(reinterpret_cast<const char *>(sidecarInputs.data()), sidecarInputs.size() * sizeof(sidecarInputs[0]));
 	replayLog("wrote %zu frames of 4P replay data to %s", sidecarInputs.size(), path.c_str());
 }
@@ -662,9 +666,17 @@ static void sidecarRead(const std::string &path)
 	sidecarLegacyIndex = false;
 	if (
 		!s || !s.read(reinterpret_cast<char *>(&header), sizeof(header)) || memcmp(header.magic, "4PR2", 4) != 0 ||
-		(header.version != 2 && header.version != 3)
+		header.version < 2 || header.version > REPLAY4P_VERSION
 	) {
 		replayLog("no 4P data for this replay (%s); P3/P4 will stand still", path.c_str());
+		return;
+	}
+	// Version 4's match setup: the .rep has its own copy of P1/P2's, so a
+	// replay only needs it skipped. The relay's broadcast mode reads it.
+	ReplaySetup setup;
+
+	if (header.version >= 4 && !s.read(reinterpret_cast<char *>(&setup), sizeof(setup))) {
+		replayLog("%s is cut short; P3/P4 will stand still", path.c_str());
 		return;
 	}
 	sidecarLegacyIndex = header.version == 2;
@@ -1090,7 +1102,9 @@ static bool deadProfileCheat(int player)
 {
 	if (
 		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ||
-		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSCLIENT
+		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSCLIENT ||
+		// A spectator's own profiles have nothing to do with the match.
+		SokuLib::mainMode == SokuLib::BATTLE_MODE_VSWATCH
 	)
 		return false;
 	return strcmp(profiles[player]->name, "dead") == 0;
@@ -1168,6 +1182,10 @@ static void warnIfGiurollTooOld()
 // all six on the machine that rolled back, and six times on a machine that did
 // not, so the two stopped agreeing on healing, time stops and KOs. It now runs
 // inside the frame loop instead; see onSimulatedFramePre/Post.
+// Spectating; defined further down, with the rest of it.
+static bool spectatorBuffering = true;
+static unsigned char spectatorWatchedMatch();
+
 // Point the camera's edge pointers at the outermost living characters.
 //
 // The camera is not only a view: the engine bounds character movement by it
@@ -1267,6 +1285,16 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 			"battle start: mainMode %d subMode %d, %zu frames of 4P replay data held",
 			SokuLib::mainMode, SokuLib::subMode, sidecarInputs.size()
 		);
+		// Spectating: the input comes from the relay's stream, all four
+		// players' of it, by battle frame (spectatorSync).
+		if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSWATCH) {
+			sidecarInputs.clear();
+			sidecarHasP1P2 = true;
+			sidecarLegacyIndex = false;
+			sidecarMismatchReported = false;
+			spectatorBuffering = true;
+			replayLog("spectating match %d", spectatorWatchedMatch());
+		}
 		// A replay keeps what its file loaded; anything else starts a new
 		// recording. Saved when the game saves the .rep, not here.
 		if (SokuLib::subMode != SokuLib::BATTLE_SUBMODE_REPLAY) {
@@ -1286,6 +1314,163 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 	return ret;
 }
 
+// --- Spectating -------------------------------------------------------------
+//
+// A spectator watches through the game's own watch scenes (mainMode VSWATCH,
+// subMode REPLAY): the relay's GAME_MATCH loads the match -- P3/P4 included,
+// parseExtraChrsGameMatch reads them for spectators too -- and the battle plays
+// the way a replay does. What the game's own protocol cannot carry is P3/P4's
+// input, nor P1/P2's select button. So the relay streams all four players'
+// confirmed input as SPECTATOR_INPUTS; it is kept here per match, and each
+// simulated frame takes what it needs into sidecarInputs, which the replay
+// code already plays from.
+//
+// The network thread fills the stream and the game thread reads it, hence the
+// mutex. A packet for another match starts the stream over.
+static std::mutex spectatorMutex;
+static std::vector<std::array<unsigned short, 4>> spectatorStream; // P1..P4
+static int spectatorStreamMatch = -1;
+static bool spectatorStreamEnded = false;
+
+// Frames to have in hand before playing, and how far behind before catching
+// up. A spectator trails the players by about the first; the second keeps a
+// short stall from turning into a permanent delay.
+static constexpr unsigned SPECTATOR_START_BUFFER = 20;
+static constexpr unsigned SPECTATOR_CATCH_UP_AT = 45;
+// Extra frames per display tick while catching up: up to 9x speed.
+static constexpr unsigned SPECTATOR_MAX_FRAMES_PER_TICK = 9;
+
+static unsigned char spectatorWatchedMatch()
+{
+	auto net = *reinterpret_cast<char **>(SokuLib::ADDR_PNETOBJECT);
+
+	// The client net object's current match id, set by its GAME_MATCH
+	// handler (0x4551FB).
+	return net ? *reinterpret_cast<unsigned char *>(net + 0x6C0) : 0;
+}
+
+void __fastcall handleSpectatorInputsPacket(PacketSpectatorInputs &packet, size_t size)
+{
+	if (size < sizeof(packet) || size < sizeof(packet) + packet.count * 8u)
+		return;
+
+	std::lock_guard<std::mutex> lock(spectatorMutex);
+
+	if (packet.matchId != spectatorStreamMatch) {
+		spectatorStreamMatch = packet.matchId;
+		spectatorStream.clear();
+		spectatorStreamEnded = false;
+	}
+	if (packet.firstFrame > spectatorStream.size())
+		return;
+	for (size_t i = spectatorStream.size() - packet.firstFrame; i < packet.count; i++)
+		spectatorStream.push_back({
+			packet.inputs[i * 4], packet.inputs[i * 4 + 1],
+			packet.inputs[i * 4 + 2], packet.inputs[i * 4 + 3]
+		});
+	if (packet.ended && packet.firstFrame + packet.count == spectatorStream.size())
+		spectatorStreamEnded = true;
+}
+
+void __declspec(naked) handleSpectatorInputsPacket_hook()
+{
+	__asm {
+		LEA ECX, [ESP + 0x70]
+		MOV EDX, [ESP + 0x14]
+		PUSH 0x41DFC2
+		JMP handleSpectatorInputsPacket
+	}
+}
+
+// How many frames of the watched match are in hand, and whether that is all.
+static unsigned spectatorAvailable(bool *ended = nullptr)
+{
+	std::lock_guard<std::mutex> lock(spectatorMutex);
+	bool same = spectatorStreamMatch == spectatorWatchedMatch();
+
+	if (ended)
+		*ended = same && spectatorStreamEnded;
+	return same ? spectatorStream.size() : 0;
+}
+
+// The watched match's newly arrived frames into sidecarInputs (P3, P4, P1, P2
+// order). Game thread, at the start of every simulated frame.
+static void spectatorSync()
+{
+	std::lock_guard<std::mutex> lock(spectatorMutex);
+
+	if (spectatorStreamMatch != spectatorWatchedMatch())
+		return;
+	for (size_t i = sidecarInputs.size(); i < spectatorStream.size(); i++) {
+		auto &e = spectatorStream[i];
+
+		sidecarInputs.push_back({e[2], e[3], e[0], e[1]});
+	}
+}
+
+static void spectatorRequest()
+{
+	PacketSpectatorRequest request{SPECTATOR_REQUEST, spectatorWatchedMatch(), 0};
+
+	{
+		std::lock_guard<std::mutex> lock(spectatorMutex);
+
+		if (spectatorStreamMatch == request.matchId)
+			request.have = spectatorStream.size();
+		if (spectatorStreamMatch == request.matchId && spectatorStreamEnded)
+			return;
+	}
+	sendPacket(request);
+}
+
+// Replaces the client net object's "may the watched battle advance" (vtable
+// +0x24, 0x454A40). CBattleWatch::process (0x428850) asks it once per display
+// tick, runs a battle frame if yes, and keeps asking and running frames while
+// it stays yes -- the game's own catch-up. The game's answer is about ITS input
+// stream, which the relay keeps topped up; this adds the one that matters, the
+// 4P stream: no frame is simulated before its input has arrived.
+static bool (__thiscall *ogSpectatorCanAdvance)(void *);
+static unsigned spectatorTickFrames = 0;
+
+static bool __fastcall spectatorCanAdvance(void *net, int)
+{
+	bool vanilla = ogSpectatorCanAdvance(net);
+	bool firstOfTick = _ReturnAddress() == reinterpret_cast<void *>(0x4288B1);
+
+	if (SokuLib::mainMode != SokuLib::BATTLE_MODE_VSWATCH)
+		return vanilla;
+	if (firstOfTick) {
+		spectatorTickFrames = 0;
+		spectatorRequest();
+	}
+	if (SokuLib::sceneId != SokuLib::SCENE_BATTLEWATCH)
+		return vanilla;
+
+	bool ended;
+	unsigned have = spectatorAvailable(&ended);
+	unsigned next = battleFrameCounter();
+	unsigned buffered = have > next ? have - next : 0;
+
+	if (buffered == 0) {
+		if (!spectatorBuffering && !ended)
+			replayLog("spectating: waiting for frame %u", next);
+		spectatorBuffering = !ended;
+		return false;
+	}
+	if (spectatorBuffering) {
+		if (buffered < SPECTATOR_START_BUFFER && !ended)
+			return false;
+		spectatorBuffering = false;
+		replayLog("spectating: playing from frame %u with %u in hand", next, buffered);
+	}
+	if (!vanilla)
+		return false;
+	if (!firstOfTick && (buffered <= SPECTATOR_CATCH_UP_AT || spectatorTickFrames >= SPECTATOR_MAX_FRAMES_PER_TICK))
+		return false;
+	spectatorTickFrames++;
+	return true;
+}
+
 // Scratch shared by the two halves of ONE simulated frame. Written by Pre and
 // read by Post of the same frame, never across frames, so it needs no saving:
 // giuroll takes its savestate before Pre runs.
@@ -1302,6 +1487,8 @@ static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
 	if (This->matchState != -1)
 		aimCamera(This);
 	sidecarFrame = battleFrameCounter();
+	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSWATCH)
+		spectatorSync();
 	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
 		unsigned at = sidecarIndex();
 		bool have = at < sidecarInputs.size();
@@ -5318,6 +5505,17 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	*(void **)0x41E010 = handlePlayerJoinPacket_hook;
 	*(void **)0x41E014 = handlePlayerJoinAckPacket_hook;
 	*(void **)0x41E01C = handleUnlockCharSelectPacket_hook;
+	// Spectating. The client's packet switch (0x41DB04) stops at opcode 14;
+	// its jump table is followed by two padding slots, 0x41E028/0x41E02C,
+	// which become opcodes 15 and 16. 15 (LOADING_READY) is only ever sent
+	// to the relay, so it goes to the switch's default.
+	*(unsigned char *)0x41DB06 = 0x0F;
+	*(DWORD *)0x41E028 = 0x41DFC2;
+	*(void **)0x41E02C = handleSpectatorInputsPacket_hook;
+	static_assert(SPECTATOR_INPUTS == 16);
+	ogSpectatorCanAdvance = reinterpret_cast<bool (__thiscall *)(void *)>(
+		SokuLib::TamperDword(0x858D38, spectatorCanAdvance)
+	);
 
 	new SokuLib::Trampoline(0x428789, sendCurrentSelectCharacter, 5);
 	SokuLib::TamperNearCall(0x45409A, parseExtraChrsGameMatch_hook);

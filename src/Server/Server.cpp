@@ -5,6 +5,7 @@
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <fstream>
 #include "Server.hpp"
 
 #define BUFFER_SIZE 1024
@@ -170,6 +171,7 @@ static bool isHandledType(unsigned char type)
 	case QUIT:
 	case CLIENT_GAME:
 	case PLAYER_JOIN_ACK:
+	case SPECTATOR_REQUEST:
 		return true;
 	default:
 		return type == PACKET_ROLLBACK_INPUT || type == PACKET_ROLLBACK_ESC;
@@ -232,7 +234,9 @@ void Server::update()
 				this->_send<SokuLib::PacketChain, SokuLib::PacketType, uint32_t>(c.second, SokuLib::CHAIN, this->_state.players.size());
 				c.second.lastChain.restart();
 			}
-			if (c.second.status > STATUS_POLITE && c.second.lastPeerList.getElapsedTime().asSeconds() >= 1) {
+			// Players only: a spectator's giuroll has no business punching
+			// through to them.
+			if (c.second.status == STATUS_PLAYING && c.second.lastPeerList.getElapsedTime().asSeconds() >= 1) {
 				this->_sendPeerList(c.second);
 				c.second.lastPeerList.restart();
 			}
@@ -247,6 +251,8 @@ void Server::update()
 				break;
 			this->_clients.erase(it);
 		}
+
+		this->_updateBroadcast();
 
 		auto status = this->_sock.receive(buffer, sizeof(buffer), recvSize, ip, port);
 
@@ -339,6 +345,8 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 	if (
 		(packet.type != CLIENT_GAME || packet.base.game.event.type != SokuLib::GAME_INPUT) &&
 		packet.type != CHAIN &&
+		// Frame rate, and printed under SokuRoll's name for 0x11.
+		packet.type != SPECTATOR_REQUEST &&
 		this->_logHandshakeOnce(client, packet, false)
 	) {
 		std::cout << "[" << client.ip.toString() << ":" << client.port << "<]: ";
@@ -360,6 +368,8 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 		return this->_handlePacket(client, packet.base.game, packetSize);
 	case PLAYER_JOIN_ACK:
 		return this->_handlePacket(client, packet.playerJoinAck, packetSize);
+	case SPECTATOR_REQUEST:
+		return this->_handlePacket(client, *reinterpret_cast<PacketSpectatorRequest *>(&packet), packetSize);
 	default:
 		return;
 	}
@@ -409,16 +419,10 @@ void Server::_handlePacket(Client &client, SokuLib::PacketInitRequ &packet, size
 		}
 		return;
 	}
-	if (
-		(packet.reqType == SokuLib::PLAY_REQU     && this->_state.players.size() == 4) ||
-		(packet.reqType == SokuLib::SPECTATE_REQU && this->_state.players.size() != 4)
-	)
+	if (packet.reqType == SokuLib::SPECTATE_REQU)
+		return this->_handleSpectatorJoin(client, packet);
+	if (packet.reqType == SokuLib::PLAY_REQU && (this->_broadcast || this->_state.players.size() == 4))
 		return this->_send<SokuLib::PacketInitError>(client, SokuLib::INIT_ERROR, SokuLib::ERROR_GAME_STATE_INVALID);
-	if (packet.reqType == SokuLib::SPECTATE_REQU) {
-		client.status = STATUS_SPECTATING;
-		client.lastChainReceived.restart();
-		return;
-	}
 
 	if (client.status != STATUS_PLAYING) {
 		PacketPlayerJoin playerJoin{PLAYER_JOIN, {0}, -1};
@@ -544,6 +548,8 @@ void Server::_handlePacket(Server::Client &client, PacketPlayerJoinAck &packet, 
 
 void Server::_handlePacket(Client &client, SokuLib::PacketGame &packet, size_t packetSize)
 {
+	if (client.status == STATUS_SPECTATING)
+		return this->_handleSpectatorGame(client, packet, packetSize);
 	if (client.status != STATUS_PLAYING)
 		return;
 	packetSize -= sizeof(SokuLib::PacketType);
@@ -1440,4 +1446,251 @@ SokuLib::Inputs Server::PlayerState::getInput(unsigned int frame)
 #else
 	return this->inputs[frame - this->frameIdOffset - 1];
 #endif
+}
+
+// --- Spectators -------------------------------------------------------------
+//
+// A spectator connects the way the game always has, "watch" instead of "play",
+// and from then on asks this relay -- its host -- for input with
+// GAME_REPLAY_REQUEST (how many inputs it has, which match it is watching).
+// The game's host side (0x4543D0) answers a request for another match with
+// that match's GAME_MATCH, which is how a spectator moves on to each new
+// match, and otherwise with up to 60 inputs from where it is.
+//
+// Those inputs are the game's own replay stream: P1 and P2 only, and only the
+// low ten bits. 4PSoku on the spectator plays all four players from the
+// SPECTATOR_INPUTS stream instead (SPECTATOR_REQUEST asks for it), so the
+// game's stream only has to keep its watch scene satisfied: two entries per
+// frame in hand, which is at least as many as it reads.
+
+static std::vector<uint8_t> buildMatchPacket(
+	const ReplayExtraPlayer (&players)[4], const unsigned char (&disabledSimul)[4],
+	unsigned char stage, unsigned char music, uint32_t seed, unsigned char matchId
+)
+{
+	PacketGameMatchEvent game;
+
+	memset(&game, 0, sizeof(game));
+	game.opcode = SokuLib::HOST_GAME;
+	game.type = SokuLib::GAME_MATCH;
+	for (int i = 0; i < 4; i++) {
+		auto &chr = game[i];
+
+		chr.character = static_cast<SokuLib::CharacterPacked>(players[i].character);
+		chr.skinId = players[i].palette;
+		chr.deckId = players[i].deckId;
+		chr.deckSize = std::min<unsigned char>(players[i].deckSize, 20);
+		memcpy(chr.cards, players[i].cards, chr.deckSize * sizeof(*chr.cards));
+		chr.disabledSimultaneousButton() = disabledSimul[i];
+	}
+	game.stageId() = stage;
+	game.musicId() = music;
+	game.randomSeed() = seed;
+	game.matchId() = matchId;
+
+	auto bytes = reinterpret_cast<const uint8_t *>(&game);
+
+	return {bytes, bytes + game.getSize()};
+}
+
+void Server::loadBroadcast(const std::string &path)
+{
+	std::ifstream s{path, std::ios::binary};
+	ReplayExtraHeader header;
+	ReplaySetup setup;
+
+	if (!s || !s.read(reinterpret_cast<char *>(&header), sizeof(header)) || memcmp(header.magic, "4PR2", 4) != 0)
+		throw std::invalid_argument(path + " is not a 4PSoku replay file (.rep.4p)");
+	if (header.version < 4)
+		throw std::invalid_argument(
+			path + " is version " + std::to_string(header.version) +
+			": it has no setup for players 1 and 2. Record a new match with this 4PSoku."
+		);
+	if (!s.read(reinterpret_cast<char *>(&setup), sizeof(setup)))
+		throw std::invalid_argument(path + " is cut short");
+
+	std::array<uint16_t, 4> e;
+
+	this->_feed.frames.clear();
+	while (this->_feed.frames.size() < header.frames && s.read(reinterpret_cast<char *>(&e), sizeof(e)))
+		this->_feed.frames.push_back({e[2], e[3], e[0], e[1]});
+
+	ReplayExtraPlayer players[4] = {setup.players[0], setup.players[1], header.players[0], header.players[1]};
+
+	this->_broadcast = true;
+	this->_feed.active = true;
+	this->_feed.matchId = 1;
+	this->_feed.available = 0;
+	this->_feed.ended = false;
+	this->_feed.matchPacket = buildMatchPacket(players, setup.disabledSimul, setup.stage, setup.music, setup.seed, 1);
+	for (int i = 0; i < 4; i++)
+		snprintf(this->_feed.names[i], sizeof(this->_feed.names[i]), "Broadcast P%d", i + 1);
+	std::cout << "Broadcasting " << path << ": " << this->_feed.frames.size() << " frames ("
+		<< this->_feed.frames.size() / 60 << " s), characters";
+	for (auto &p : players)
+		std::cout << " " << (int)p.character;
+	std::cout << ", stage " << (int)setup.stage << ". It starts when the first spectator connects, "
+		<< "and plays again as a new match 10 s after it ends. Players cannot join." << std::endl;
+}
+
+void Server::_updateBroadcast()
+{
+	if (!this->_broadcast || !this->_broadcastStarted)
+		return;
+
+	double seconds = this->_broadcastClock.getElapsedTime().asSeconds();
+	size_t total = this->_feed.frames.size();
+
+	this->_feed.available = std::min<size_t>(total, static_cast<size_t>(seconds * 60));
+	if (this->_feed.available == total && !this->_feed.ended) {
+		this->_feed.ended = true;
+		std::cout << "Broadcast of match " << (int)this->_feed.matchId << " finished." << std::endl;
+	}
+	if (this->_feed.ended && seconds * 60 > total + 600) {
+		this->_feed.matchId++;
+		if (this->_feed.matchId == 0)
+			this->_feed.matchId = 1;
+		this->_feed.available = 0;
+		this->_feed.ended = false;
+		this->_feed.matchPacket.back() = this->_feed.matchId;
+		this->_broadcastClock.restart();
+		std::cout << "Broadcasting it again as match " << (int)this->_feed.matchId << "." << std::endl;
+	}
+}
+
+void Server::_handleSpectatorJoin(Client &client, SokuLib::PacketInitRequ &packet)
+{
+	if (!this->_feed.active) {
+		std::cout << client.ip.toString() << ":" << client.port << " (\"" << packet.name
+			<< "\") wants to spectate, but no match is being played." << std::endl;
+		return this->_send<SokuLib::PacketInitError>(client, SokuLib::INIT_ERROR, SokuLib::ERROR_GAME_STATE_INVALID);
+	}
+
+	PacketInitSucc response{SokuLib::INIT_SUCCESS, {0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00}, 132, {0, 0}};
+	char *names[4] = {response.p1Name, response.p2Name, response.p3Name, response.p4Name};
+
+	memset(client.name, 0, sizeof(client.name));
+	memcpy(client.name, packet.name, std::min<size_t>(packet.nameLength, sizeof(client.name) - 1));
+	for (int i = 0; i < 4; i++)
+		memcpy(names[i], this->_feed.names[i], 32);
+	response.swrDisabled = 0;
+	this->_send(client, &response, sizeof(response));
+	if (client.status != STATUS_SPECTATING)
+		std::cout << "\"" << client.name << "\" is spectating." << std::endl;
+	client.status = STATUS_SPECTATING;
+	client.lastChainReceived.restart();
+	if (this->_broadcast && !this->_broadcastStarted) {
+		this->_broadcastStarted = true;
+		this->_broadcastClock.restart();
+	}
+}
+
+void Server::_handleSpectatorGame(Client &client, SokuLib::PacketGame &packet, size_t packetSize)
+{
+	packetSize -= sizeof(SokuLib::PacketType);
+	if (packetSize < sizeof(SokuLib::GameType) || !this->_feed.active)
+		return;
+	switch (packet.event.type) {
+	case SokuLib::GAME_REPLAY_REQUEST:
+		if (packetSize < sizeof(SokuLib::GameReplayRequestEvent))
+			return;
+		return this->_sendReplayToSpectator(client, packet.event.replayRequest);
+	case SokuLib::GAME_MATCH_REQUEST:
+		return this->_send(client, this->_feed.matchPacket.data(), this->_feed.matchPacket.size());
+	default:
+		// Counted like any other unexpected packet, so the first test of a
+		// spectator says what else it sends.
+		if (client.unhandled[0x80 | packet.event.type]++ == 0)
+			std::cout << "spectator \"" << client.name << "\" sent game event " << (int)packet.event.type
+				<< " -- not handled" << std::endl;
+		return;
+	}
+}
+
+static uint32_t adler32(const uint8_t *data, size_t size)
+{
+	uint32_t a = 1, b = 0;
+
+	for (size_t i = 0; i < size; i++) {
+		a = (a + data[i]) % 65521;
+		b = (b + a) % 65521;
+	}
+	return (b << 16) | a;
+}
+
+void Server::_sendReplayToSpectator(Client &client, SokuLib::GameReplayRequestEvent &packet)
+{
+	if (packet.matchId != this->_feed.matchId)
+		return this->_send(client, this->_feed.matchPacket.data(), this->_feed.matchPacket.size());
+
+	uint32_t total = 2 * static_cast<uint32_t>(this->_feed.available);
+
+	if (packet.frameId >= total)
+		return;
+
+	// The decompressed body, as 0x4540E0 reads it: inputs held after this
+	// packet, end of the match's inputs (0: not over -- the spectator plays
+	// to the KO on its own), match id, count, then the inputs newest first.
+	unsigned n = std::min<uint32_t>(60, total - packet.frameId);
+	uint8_t body[10 + 2 * 60];
+	uint32_t after = packet.frameId + n;
+	uint32_t end = 0;
+
+	memcpy(body, &after, 4);
+	memcpy(body + 4, &end, 4);
+	body[8] = this->_feed.matchId;
+	body[9] = n;
+	for (unsigned k = 0; k < n; k++) {
+		uint32_t entry = packet.frameId + n - 1 - k;
+		uint16_t v = this->_feed.frames[entry / 2][entry % 2] & 0x3FF;
+
+		memcpy(body + 10 + 2 * k, &v, 2);
+	}
+
+	// A zlib stream holding one stored (uncompressed) block: the game inflates
+	// it with zlib 1.2.3 (0x409AB0), and the relay needs no zlib of its own.
+	size_t bodySize = 10 + 2 * n;
+	uint8_t out[4 + 2 + 5 + sizeof(body) + 4];
+	size_t o = 0;
+	uint16_t len = static_cast<uint16_t>(bodySize);
+	uint32_t check = adler32(body, bodySize);
+
+	out[o++] = SokuLib::HOST_GAME;
+	out[o++] = SokuLib::GAME_REPLAY;
+	o++; // size, below
+	out[o++] = 0x78;
+	out[o++] = 0x01;
+	out[o++] = 0x01;
+	out[o++] = len & 0xFF;
+	out[o++] = len >> 8;
+	out[o++] = ~len & 0xFF;
+	out[o++] = (~len >> 8) & 0xFF;
+	memcpy(out + o, body, bodySize);
+	o += bodySize;
+	out[o++] = check >> 24;
+	out[o++] = (check >> 16) & 0xFF;
+	out[o++] = (check >> 8) & 0xFF;
+	out[o++] = check & 0xFF;
+	out[2] = static_cast<uint8_t>(o - 3);
+	this->_sock.send(out, o, client.ip, client.port);
+}
+
+void Server::_handlePacket(Client &client, PacketSpectatorRequest &packet, size_t packetSize)
+{
+	if (packetSize < sizeof(packet) || client.status != STATUS_SPECTATING || !this->_feed.active)
+		return;
+	if (packet.matchId != this->_feed.matchId || packet.have >= this->_feed.available)
+		return;
+
+	unsigned count = std::min<size_t>(SPECTATOR_FRAMES_PER_PACKET, this->_feed.available - packet.have);
+	uint8_t buffer[sizeof(PacketSpectatorInputs) + SPECTATOR_FRAMES_PER_PACKET * 8];
+	auto out = reinterpret_cast<PacketSpectatorInputs *>(buffer);
+
+	out->type = SPECTATOR_INPUTS;
+	out->matchId = this->_feed.matchId;
+	out->firstFrame = packet.have;
+	out->count = count;
+	out->ended = this->_feed.ended && packet.have + count == this->_feed.available;
+	memcpy(out->inputs, &this->_feed.frames[packet.have], count * 8);
+	this->_sock.send(buffer, sizeof(PacketSpectatorInputs) + count * 8, client.ip, client.port);
 }

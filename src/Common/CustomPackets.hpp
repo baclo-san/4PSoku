@@ -26,13 +26,40 @@ enum CustomOpcodes : unsigned char {
 	HOST_GAME,
 	CLIENT_GAME,
 	LOADING_READY,
-	_15
+	// Relay -> spectator: confirmed inputs of all four players. See
+	// PacketSpectatorInputs.
+	SPECTATOR_INPUTS,
+	// Spectator -> relay: which match it is watching and how many frames of it
+	// it holds. The relay answers with the next ones.
+	SPECTATOR_REQUEST,
 };
 
 struct PacketPlayerJoin {
 	CustomOpcodes type;
 	char name[32] = {0};
 	char slot;
+};
+
+// Frames [firstFrame, firstFrame + count) of match matchId, numbered by the
+// battle frame counter, each four packed Inputs in P1..P4 order. `ended` says
+// the last frame of the match is in hand -- the spectator need not wait for
+// more.
+struct PacketSpectatorInputs {
+	CustomOpcodes type;
+	uint8_t matchId;
+	uint32_t firstFrame;
+	uint16_t count;
+	uint8_t ended;
+	uint16_t inputs[0];
+};
+
+// Small enough for any path: 8 bytes a frame.
+constexpr unsigned SPECTATOR_FRAMES_PER_PACKET = 120;
+
+struct PacketSpectatorRequest {
+	CustomOpcodes type;
+	uint8_t matchId;
+	uint32_t have;
 };
 
 struct PacketPlayerJoinAck {
