@@ -5160,6 +5160,10 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	s_originalCProfileDeckEdit_Destructor= SokuLib::TamperDword(&SokuLib::VTable_ProfileDeckEdit.onDestruct,CProfileDeckEdit_Destructor);
 	s_ogHudRender = (int (__thiscall *)(void *))SokuLib::TamperDword(0x85b544, onHudRender);
 	memcpy((void *)0x858B80, versionString2v2, sizeof(versionString2v2));
+	// The client net object's vtable, in .rdata: see spectatorCanAdvance.
+	ogSpectatorCanAdvance = reinterpret_cast<bool (__thiscall *)(void *)>(
+		SokuLib::TamperDword(0x858D38, spectatorCanAdvance)
+	);
 	::VirtualProtect((PVOID)RDATA_SECTION_OFFSET, RDATA_SECTION_SIZE, old, &old);
 
 	::VirtualProtect((PVOID)TEXT_SECTION_OFFSET, TEXT_SECTION_SIZE, PAGE_EXECUTE_WRITECOPY, &old);
@@ -5513,9 +5517,6 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	*(DWORD *)0x41E028 = 0x41DFC2;
 	*(void **)0x41E02C = handleSpectatorInputsPacket_hook;
 	static_assert(SPECTATOR_INPUTS == 16);
-	ogSpectatorCanAdvance = reinterpret_cast<bool (__thiscall *)(void *)>(
-		SokuLib::TamperDword(0x858D38, spectatorCanAdvance)
-	);
 
 	new SokuLib::Trampoline(0x428789, sendCurrentSelectCharacter, 5);
 	SokuLib::TamperNearCall(0x45409A, parseExtraChrsGameMatch_hook);
