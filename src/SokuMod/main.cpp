@@ -714,10 +714,10 @@ static int __fastcall saveReplayHook(void *replay, int, const char *path)
 
 // Replaces the one call of InputManager::readReplay (0x42EAC0) at 0x44B3F1,
 // in the replay menu.
-// Replaces the call at 0x4821AC, in the battle-state handler 0x482170 (vtable
-// slot +0x14, so it runs inside the frame, after onSimulatedFramePre and
-// before any character reads its input): 0x42ADB0 copies this frame's P1/P2
-// input from the .rep into their KeymapManagers.
+// Replaces the calls at 0x4821AC and 0x47FF77, in two battle-state handlers
+// (0x482170 is vtable slot +0x14; both run inside the frame, after
+// onSimulatedFramePre and before any character reads its input): 0x42ADB0
+// copies this frame's P1/P2 input from the .rep into their KeymapManagers.
 //
 // It masks it to 0x3FF -- bits above that are the replay viewer's F-keys
 // (0x42ADEC) -- so the .rep has no pause and no select. Harmless in 1v1; in
@@ -5240,6 +5240,10 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	SokuLib::TamperNearCall(0x454375, saveReplayHook);
 	SokuLib::TamperNearCall(0x44B3F1, readReplayHook);
 	SokuLib::TamperNearCall(0x4821AC, replayFeedHook);
+	// The same feed in the handler of another battle state; missed at first,
+	// and a replay in giuroll's check mode took P1's .rep input there at frame
+	// 7134 and played a different match.
+	SokuLib::TamperNearCall(0x47FF77, replayFeedHook);
 	*(char *)0x45409F = 0x90;
 	og_FUNCALL43F996 = SokuLib::TamperNearJmpOpr(0x43F996, onInputsReset);
 
