@@ -48,6 +48,7 @@ def run(port):
     d = recv_until(lambda d: d[0] == 6, "INIT_SUCCESS")
     names = [d[13 + 32 * i:13 + 32 * i + 32].split(b"\0")[0] for i in range(2)]
     print("INIT_SUCCESS, names", names, "size", len(d))
+    assert d[5] & 1, "INIT_SUCCESS does not flag the client as a spectator"
 
     # Stale match id: the relay must answer with GAME_MATCH.
     s.sendto(bytes([0x0E, 0x0B]) + struct.pack("<IB", 0, 0), addr)

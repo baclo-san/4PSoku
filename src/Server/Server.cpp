@@ -1566,7 +1566,10 @@ void Server::_handleSpectatorJoin(Client &client, SokuLib::PacketInitRequ &packe
 		return this->_send<SokuLib::PacketInitError>(client, SokuLib::INIT_ERROR, SokuLib::ERROR_GAME_STATE_INVALID);
 	}
 
-	PacketInitSucc response{SokuLib::INIT_SUCCESS, {0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00}, 132, {0, 0}};
+	// The fifth byte is a flag word the client reads at 0x454760: bit 0 makes
+	// it a spectator (net +0x6E8), without which it plays the match's setup
+	// as a player would and its watch loading scene never gets going.
+	PacketInitSucc response{SokuLib::INIT_SUCCESS, {0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00}, 132, {0, 0}};
 	char *names[4] = {response.p1Name, response.p2Name, response.p3Name, response.p4Name};
 
 	memset(client.name, 0, sizeof(client.name));
