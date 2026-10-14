@@ -1168,6 +1168,50 @@ static void warnIfGiurollTooOld()
 // all six on the machine that rolled back, and six times on a machine that did
 // not, so the two stopped agreeing on healing, time stops and KOs. It now runs
 // inside the frame loop instead; see onSimulatedFramePre/Post.
+// Point the camera's edge pointers at the outermost living characters.
+//
+// The camera is not only a view: the engine bounds character movement by it
+// (the screen edges are walls), so what it is aimed at changes the match.
+// This used to run once per CALL of the battle manager, after all of that
+// call's frames -- and a call runs several frames whenever giuroll rolls back
+// and re-simulates. Every re-simulated frame after the first was bounded by
+// a camera aimed at stale positions, so a machine that rolled back played a
+// different match from one that did not. Found replaying a 2026-10-12 4P
+// desync in giuroll's check mode, which also runs several frames per call:
+// a dash from beside the screen edge covered 10 px a frame instead of 14.
+//
+// Now it also runs at the start of every simulated frame (onSimulatedFramePre).
+// The positions there are the ones the previous frame ended with, so a frame
+// sees exactly what it saw when it first ran -- including the first frame
+// after a savestate restore, which used to inherit the pointers of whatever
+// frame ran last.
+static void aimCamera(SokuLib::BattleManager *This)
+{
+	int index = 0;
+
+	if (This->matchState <= 2 || This->matchState == 4)
+		for (; index < 4; index++) {
+			SokuLib::camera.p1X = &dataMgr->players[index]->objectBase.position.x;
+			SokuLib::camera.p2X = &dataMgr->players[index]->objectBase.position.x;
+			SokuLib::camera.p1Y = &dataMgr->players[index]->objectBase.position.y;
+			SokuLib::camera.p2Y = &dataMgr->players[index]->objectBase.position.y;
+			if (dataMgr->players[index]->objectBase.hp != 0)
+				break;
+		}
+	for (; index < 4; index++) {
+		if (dataMgr->players[index]->objectBase.hp == 0 && (This->matchState <= 2 || This->matchState == 4))
+			continue;
+		if (*SokuLib::camera.p1X > dataMgr->players[index]->objectBase.position.x)
+			SokuLib::camera.p1X = &dataMgr->players[index]->objectBase.position.x;
+		if (*SokuLib::camera.p2X < dataMgr->players[index]->objectBase.position.x)
+			SokuLib::camera.p2X = &dataMgr->players[index]->objectBase.position.x;
+		if (*SokuLib::camera.p1Y > dataMgr->players[index]->objectBase.position.y)
+			SokuLib::camera.p1Y = &dataMgr->players[index]->objectBase.position.y;
+		if (*SokuLib::camera.p2Y < dataMgr->players[index]->objectBase.position.y)
+			SokuLib::camera.p2Y = &dataMgr->players[index]->objectBase.position.y;
+	}
+}
+
 int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 {
 	if (This->matchState == -1)
@@ -1237,29 +1281,8 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 	healingCircle[1].setRotation(-healingCircle[0].getRotation());
 
 	int ret = (This->*s_originalBattleMgrOnProcess)();
-	int index = 0;
 
-	if (This->matchState <= 2 || This->matchState == 4)
-		for (; index < 4; index++) {
-			SokuLib::camera.p1X = &dataMgr->players[index]->objectBase.position.x;
-			SokuLib::camera.p2X = &dataMgr->players[index]->objectBase.position.x;
-			SokuLib::camera.p1Y = &dataMgr->players[index]->objectBase.position.y;
-			SokuLib::camera.p2Y = &dataMgr->players[index]->objectBase.position.y;
-			if (dataMgr->players[index]->objectBase.hp != 0)
-				break;
-		}
-	for (; index < 4; index++) {
-		if (dataMgr->players[index]->objectBase.hp == 0 && (This->matchState <= 2 || This->matchState == 4))
-			continue;
-		if (*SokuLib::camera.p1X > dataMgr->players[index]->objectBase.position.x)
-			SokuLib::camera.p1X = &dataMgr->players[index]->objectBase.position.x;
-		if (*SokuLib::camera.p2X < dataMgr->players[index]->objectBase.position.x)
-			SokuLib::camera.p2X = &dataMgr->players[index]->objectBase.position.x;
-		if (*SokuLib::camera.p1Y > dataMgr->players[index]->objectBase.position.y)
-			SokuLib::camera.p1Y = &dataMgr->players[index]->objectBase.position.y;
-		if (*SokuLib::camera.p2Y < dataMgr->players[index]->objectBase.position.y)
-			SokuLib::camera.p2Y = &dataMgr->players[index]->objectBase.position.y;
-	}
+	aimCamera(This);
 	return ret;
 }
 
@@ -1276,6 +1299,8 @@ static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
 	// used to be set once, by match setup, which a replay does not even run --
 	// so playback held one input for the whole match. The battle frame counter
 	// is rewound with everything else, so seeking backwards stays in step.
+	if (This->matchState != -1)
+		aimCamera(This);
 	sidecarFrame = battleFrameCounter();
 	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY) {
 		unsigned at = sidecarIndex();
