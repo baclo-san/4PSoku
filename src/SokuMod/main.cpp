@@ -4878,7 +4878,8 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		// 0x97 -> 0x98: P2's deck from the match packet (takeP2DeckFromMatch).
 		// 0x98 -> 0x99: P3/P4 hit healing cleared per pass (extraHealing).
 		// 0x99 -> 0x9A: P3's hit healing goes to extraHealing[0] (index fix).
-		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x9A
+		// 0x9A -> 0x9B: camera aimed every simulated frame (aimCamera).
+		0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x9B
 	};
 
 	myModule = hMyModule;

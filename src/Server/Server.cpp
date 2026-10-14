@@ -64,7 +64,8 @@ const uint8_t versionString2v2[] = {
 	// gives P2 its own profile's deck and desyncs at P2's first card.
 	// 0x98 -> 0x99: 4PSoku clears P3/P4 hit healing per pass; older ones desync.
 	// 0x99 -> 0x9A: P3 hit healing fixed in 4PSoku; older ones desync.
-	0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x9A
+	// 0x9A -> 0x9B: camera aimed every simulated frame; older ones desync.
+	0xC6, 0x24, 0x8C, 0xA4, 0x15, 0x44, 0x32, 0x9B
 };
 
 const char emptyMagicString[32] = "\0\x1F\x54\xF2\xA2\x67\x90\x78\xC2";
