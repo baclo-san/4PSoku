@@ -1471,12 +1471,58 @@ static void (__thiscall *ogNetSetState)(void *, char);
 
 static void __fastcall netSetState(char *net, int, char state)
 {
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSWATCH && net[0x6C] != state)
+	if (net[0x6C] != state)
 		replayLog(
-			"spectating: net state %d -> %d from %p, scene %d, match %d",
-			net[0x6C], state, _ReturnAddress(), SokuLib::sceneId, (unsigned char)net[0x6C0]
+			"net state %d -> %d from %p, scene %d, mode %d/%d, match %d",
+			net[0x6C], state, _ReturnAddress(), SokuLib::sceneId, SokuLib::mainMode, SokuLib::subMode,
+			(unsigned char)net[0x6C0]
 		);
 	ogNetSetState(net, state);
+}
+
+// The two watch scenes' onProcess, logged whenever what they return or what
+// they decide by changes. The loading scene (0x428AA0) takes the received
+// match in phase 0 (+0x1E0), waits for the loader (0x89868C == 3) in phase 1,
+// then returns 15; the battle (0x428850) returns 12 to go back to loading.
+static int (__thiscall *ogLoadingWatchProcess)(void *);
+static int (__thiscall *ogBattleWatchProcess)(void *);
+static char watchLastReport[64];
+
+static void watchReport(const char *scene, int ret, int phase)
+{
+	auto net = *reinterpret_cast<char **>(SokuLib::ADDR_PNETOBJECT);
+	char line[sizeof(watchLastReport)];
+
+	snprintf(
+		line, sizeof(line), "%s %d %d %d %d %d %d %d", scene, ret, phase,
+		net ? net[0x6C] : -9, net ? net[0x3AD] : -9, *reinterpret_cast<int *>(0x89868C),
+		SokuLib::mainMode, SokuLib::subMode
+	);
+	if (strcmp(line, watchLastReport) == 0)
+		return;
+	strcpy(watchLastReport, line);
+	replayLog(
+		"%s scene: returns %d, phase %d, net state %d, match waiting %d, loader %d, mode %d/%d",
+		scene, ret, phase, net ? net[0x6C] : -9, net ? net[0x3AD] : -9, *reinterpret_cast<int *>(0x89868C),
+		SokuLib::mainMode, SokuLib::subMode
+	);
+}
+
+static int __fastcall loadingWatchProcess(char *scene, int)
+{
+	int ret = ogLoadingWatchProcess(scene);
+
+	watchReport("watch loading", ret, *reinterpret_cast<int *>(scene + 0x1E0));
+	return ret;
+}
+
+static int __fastcall battleWatchProcess(char *scene, int)
+{
+	int ret = ogBattleWatchProcess(scene);
+	auto mgr = *reinterpret_cast<char **>(0x8985E4);
+
+	watchReport("watch battle", ret, mgr ? *reinterpret_cast<int *>(mgr + 0x88) : -1);
+	return ret;
 }
 
 // The game's GAME_REPLAY handler, called at 0x455012 with the decoded packet:
@@ -5252,6 +5298,12 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	// The client net object's vtable, in .rdata: see spectatorCanAdvance.
 	ogNetSetState = reinterpret_cast<void (__thiscall *)(void *, char)>(
 		SokuLib::TamperDword(0x858D40, netSetState)
+	);
+	ogLoadingWatchProcess = reinterpret_cast<int (__thiscall *)(void *)>(
+		SokuLib::TamperDword(0x858184, loadingWatchProcess)
+	);
+	ogBattleWatchProcess = reinterpret_cast<int (__thiscall *)(void *)>(
+		SokuLib::TamperDword(0x857590, battleWatchProcess)
 	);
 	ogSpectatorCanAdvance = reinterpret_cast<bool (__thiscall *)(void *)>(
 		SokuLib::TamperDword(0x858D38, spectatorCanAdvance)
