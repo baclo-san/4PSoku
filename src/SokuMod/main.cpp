@@ -1184,6 +1184,9 @@ static void warnIfGiurollTooOld()
 // inside the frame loop instead; see onSimulatedFramePre/Post.
 // Spectating; defined further down, with the rest of it.
 static bool spectatorBuffering = true;
+// The match whose battle has started here, -1 for none. Until it has, the
+// battle frame counter still holds whatever the last battle left in it.
+static int spectatorBattleMatch = -1;
 static unsigned char spectatorWatchedMatch();
 
 // Point the camera's edge pointers at the outermost living characters.
@@ -1293,7 +1296,8 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 			sidecarLegacyIndex = false;
 			sidecarMismatchReported = false;
 			spectatorBuffering = true;
-			replayLog("spectating match %d", spectatorWatchedMatch());
+			spectatorBattleMatch = spectatorWatchedMatch();
+			replayLog("spectating match %d", spectatorBattleMatch);
 		}
 		// A replay keeps what its file loaded; anything else starts a new
 		// recording. Saved when the game saves the .rep, not here.
@@ -1431,6 +1435,28 @@ static void spectatorRequest()
 // 4P stream: no frame is simulated before its input has arrived.
 static bool (__thiscall *ogSpectatorCanAdvance)(void *);
 static unsigned spectatorTickFrames = 0;
+static DWORD spectatorLastReport = 0;
+
+// What the watch loop is waiting on, once a second while it is not playing.
+static void spectatorReportWait(const char *why, unsigned have, unsigned next, bool vanilla)
+{
+	DWORD now = GetTickCount();
+
+	if (now - spectatorLastReport < 1000)
+		return;
+	spectatorLastReport = now;
+
+	int streamMatch;
+	{
+		std::lock_guard<std::mutex> lock(spectatorMutex);
+		streamMatch = spectatorStreamMatch;
+	}
+	replayLog(
+		"spectating: %s -- watching match %d, 4P stream for match %d with %u frames, next frame %u, battle started %s, game's own input %s",
+		why, spectatorWatchedMatch(), streamMatch, have, next,
+		spectatorBattleMatch == spectatorWatchedMatch() ? "yes" : "no", vanilla ? "ready" : "not ready"
+	);
+}
 
 static bool __fastcall spectatorCanAdvance(void *net, int)
 {
@@ -1443,28 +1469,37 @@ static bool __fastcall spectatorCanAdvance(void *net, int)
 		spectatorTickFrames = 0;
 		spectatorRequest();
 	}
-	if (SokuLib::sceneId != SokuLib::SCENE_BATTLEWATCH)
+	if (SokuLib::sceneId != SokuLib::SCENE_BATTLEWATCH) {
+		spectatorBattleMatch = -1;
 		return vanilla;
+	}
 
 	bool ended;
 	unsigned have = spectatorAvailable(&ended);
-	unsigned next = battleFrameCounter();
+	unsigned next = spectatorBattleMatch == spectatorWatchedMatch() ? battleFrameCounter() : 0;
 	unsigned buffered = have > next ? have - next : 0;
 
 	if (buffered == 0) {
 		if (!spectatorBuffering && !ended)
 			replayLog("spectating: waiting for frame %u", next);
 		spectatorBuffering = !ended;
+		if (!ended)
+			spectatorReportWait("no 4P input in hand", have, next, vanilla);
 		return false;
 	}
 	if (spectatorBuffering) {
-		if (buffered < SPECTATOR_START_BUFFER && !ended)
+		if (buffered < SPECTATOR_START_BUFFER && !ended) {
+			spectatorReportWait("buffering", have, next, vanilla);
 			return false;
+		}
 		spectatorBuffering = false;
 		replayLog("spectating: playing from frame %u with %u in hand", next, buffered);
 	}
-	if (!vanilla)
+	if (!vanilla) {
+		if (firstOfTick)
+			spectatorReportWait("the game's own input stream is behind", have, next, vanilla);
 		return false;
+	}
 	if (!firstOfTick && (buffered <= SPECTATOR_CATCH_UP_AT || spectatorTickFrames >= SPECTATOR_MAX_FRAMES_PER_TICK))
 		return false;
 	spectatorTickFrames++;

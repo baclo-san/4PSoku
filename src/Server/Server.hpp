@@ -62,6 +62,10 @@ private:
 		// Packet types this relay has no handler for, counted per type.
 		// See _handlePacket for why these are counted rather than printed.
 		std::map<unsigned char, unsigned> unhandled;
+		// The match a spectator last asked SPECTATOR_INPUTS for; logged on change.
+		int spectatorRequestMatch = -1;
+		// Likewise for the game's own GAME_REPLAY_REQUEST.
+		int replayRequestMatch = -1;
 		// A rejected game id is explained once and then counted: the client
 		// retries several times a second and never gives up on its own.
 		bool badGameIdReported = false;

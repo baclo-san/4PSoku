@@ -1622,6 +1622,11 @@ void Server::_sendReplayToSpectator(Client &client, SokuLib::GameReplayRequestEv
 {
 	if (packet.matchId != this->_feed.matchId)
 		return this->_send(client, this->_feed.matchPacket.data(), this->_feed.matchPacket.size());
+	if (client.replayRequestMatch != packet.matchId) {
+		client.replayRequestMatch = packet.matchId;
+		std::cout << "spectator \"" << client.name << "\" loaded match " << (int)packet.matchId
+			<< " and asks for the game's own input from entry " << packet.frameId << std::endl;
+	}
 
 	uint32_t total = 2 * static_cast<uint32_t>(this->_feed.available);
 
@@ -1679,6 +1684,14 @@ void Server::_handlePacket(Client &client, PacketSpectatorRequest &packet, size_
 {
 	if (packetSize < sizeof(packet) || client.status != STATUS_SPECTATING || !this->_feed.active)
 		return;
+	// The first request for each match, so a stuck spectator shows whether
+	// it asks at all and for which match.
+	if (client.spectatorRequestMatch != packet.matchId) {
+		client.spectatorRequestMatch = packet.matchId;
+		std::cout << "spectator \"" << client.name << "\" asks for the 4P input of match " << (int)packet.matchId
+			<< " from frame " << packet.have << "; the relay is on match " << (int)this->_feed.matchId
+			<< " with " << this->_feed.available << " frames released" << std::endl;
+	}
 	if (packet.matchId != this->_feed.matchId || packet.have >= this->_feed.available)
 		return;
 
