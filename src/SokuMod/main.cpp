@@ -714,6 +714,34 @@ static int __fastcall saveReplayHook(void *replay, int, const char *path)
 
 // Replaces the one call of InputManager::readReplay (0x42EAC0) at 0x44B3F1,
 // in the replay menu.
+// Replaces the call at 0x4821AC, in the battle-state handler 0x482170 (vtable
+// slot +0x14, so it runs inside the frame, after onSimulatedFramePre and
+// before any character reads its input): 0x42ADB0 copies this frame's P1/P2
+// input from the .rep into their KeymapManagers.
+//
+// It masks it to 0x3FF -- bits above that are the replay viewer's F-keys
+// (0x42ADEC) -- so the .rep has no pause and no select. Harmless in 1v1; in
+// 2v2 select switches a player's opponent, and a 2026-10-12 replay drifted at
+// frame 738, seven frames after P1 switched. A version-3 .4p holds P1/P2's
+// raw input including both, so it is written over the .rep's here. A
+// version-2 .4p has P1/P2 from the edited keyMap copy, worse than the .rep,
+// so those keep the .rep.
+static void __fastcall replayFeedHook(void *inputManager, int)
+{
+	reinterpret_cast<void (__thiscall *)(void *)>(0x42ADB0)(inputManager);
+
+	unsigned at = sidecarIndex();
+
+	if (sidecarLegacyIndex || !sidecarHasP1P2 || at >= sidecarInputs.size())
+		return;
+	for (int i = 0; i < 2; i++) {
+		auto km = dataMgr->players[i]->keyManager ? dataMgr->players[i]->keyManager->keymapManager : nullptr;
+
+		if (km)
+			km->inKeys.raw = sidecarInputs[at][2 + i];
+	}
+}
+
 static bool __fastcall readReplayHook(void *inputManager, int, const char *path)
 {
 	bool ok = reinterpret_cast<bool (__thiscall *)(void *, const char *)>(0x42EAC0)(inputManager, path);
@@ -1257,19 +1285,6 @@ static void __fastcall onSimulatedFramePre(SokuLib::BattleManager *This)
 		replayExtraInputs[1].inKeys.raw = have ? sidecarInputs[at][1] : 0;
 		keys.first.keymapManager = &replayExtraInputs[0];
 		keys.second.keymapManager = &replayExtraInputs[1];
-		// P1/P2 from the .4p as well, over what the game just fed them from
-		// the .rep (0x4821AC, before this loop). The .rep does not keep the
-		// select bit -- harmless in 1v1, but in 2v2 select switches a
-		// player's opponent, so a 2026-10-12 replay drifted at frame 738,
-		// seven frames after P1 switched. A version-2 .4p has P1/P2 from the
-		// edited keyMap copy, worse than the .rep, so those keep the .rep.
-		if (have && !sidecarLegacyIndex)
-			for (int i = 0; i < 2; i++) {
-				auto km = dataMgr->players[i]->keyManager ? dataMgr->players[i]->keyManager->keymapManager : nullptr;
-
-				if (km)
-					km->inKeys.raw = sidecarInputs[at][2 + i];
-			}
 	}
 	frameSkipped = This->matchState == -1;
 	for (auto &player : dataMgr->players)
@@ -5224,6 +5239,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	SokuLib::TamperNearCall(0x43EC59, saveReplayHook);
 	SokuLib::TamperNearCall(0x454375, saveReplayHook);
 	SokuLib::TamperNearCall(0x44B3F1, readReplayHook);
+	SokuLib::TamperNearCall(0x4821AC, replayFeedHook);
 	*(char *)0x45409F = 0x90;
 	og_FUNCALL43F996 = SokuLib::TamperNearJmpOpr(0x43F996, onInputsReset);
 
