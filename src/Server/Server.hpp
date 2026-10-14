@@ -228,9 +228,14 @@ private:
 		unsigned char matchId = 0;
 		std::vector<uint8_t> matchPacket;
 		std::vector<std::array<uint16_t, 4>> frames;
+		// Live feed: which frames have arrived. `available` is how many from
+		// frame 0 on have, with no gap -- all a spectator can play.
+		std::vector<bool> known;
 		size_t available = 0;
 		bool ended = false;
 		char names[4][32] = {};
+		// Live feed: the match's random seed, which PLAYER_FEED names it by.
+		uint32_t seed = 0;
 	};
 	SpectatorFeed _feed;
 	// Broadcast mode: one recorded match, released at 60 frames a second from
@@ -243,6 +248,8 @@ private:
 	void _handleSpectatorJoin(Client &client, SokuLib::PacketInitRequ &packet);
 	void _handleSpectatorGame(Client &client, SokuLib::PacketGame &packet, size_t packetSize);
 	void _handlePacket(Client &client, PacketSpectatorRequest &packet, size_t packetSize);
+	void _handlePacket(Client &client, PacketPlayerFeed &packet, size_t packetSize);
+	void _startLiveFeed(const PacketGameMatchEvent &game);
 	void _sendReplayToSpectator(Client &client, SokuLib::GameReplayRequestEvent &packet);
 
 	void _send(Client &client, void *data, size_t size);

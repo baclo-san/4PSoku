@@ -1191,6 +1191,9 @@ static bool spectatorBuffering = true;
 // battle frame counter still holds whatever the last battle left in it.
 static int spectatorBattleMatch = -1;
 static unsigned char spectatorWatchedMatch();
+// The newest final frame of this battle, and its sender; see FourPSokuFrameConfirmed.
+static int feedConfirmed = -1;
+static void sendSpectatorFeed();
 
 // Point the camera's edge pointers at the outermost living characters.
 //
@@ -1293,6 +1296,7 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 		);
 		// Spectating: the input comes from the relay's stream, all four
 		// players' of it, by battle frame (spectatorSync).
+		feedConfirmed = -1;
 		if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSWATCH) {
 			sidecarInputs.clear();
 			sidecarHasP1P2 = true;
@@ -1318,6 +1322,7 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 	int ret = (This->*s_originalBattleMgrOnProcess)();
 
 	aimCamera(This);
+	sendSpectatorFeed();
 	return ret;
 }
 
@@ -1600,6 +1605,58 @@ static bool __fastcall spectatorCanAdvance(void *net, int)
 		return false;
 	spectatorTickFrames++;
 	return true;
+}
+
+// --- Feeding the relay's spectators (players' side) --------------------------
+//
+// giuroll calls FourPSokuFrameConfirmed when a frame becomes final: every
+// player's input for it is known and it was simulated with exactly those, so
+// its sidecarInputs entry -- written by each simulation of the frame, the last
+// one winning -- is final too, and the same on all four machines. Every few
+// battle-manager calls the newest final frames go to the relay, which streams
+// them to spectators.
+static unsigned feedCalls = 0;
+
+extern "C" __declspec(dllexport) void FourPSokuFrameConfirmed(unsigned frame)
+{
+	if (static_cast<int>(frame) > feedConfirmed)
+		feedConfirmed = static_cast<int>(frame);
+}
+
+static void sendSpectatorFeed()
+{
+	if (SokuLib::mainMode != SokuLib::BATTLE_MODE_VSCLIENT || feedConfirmed < 0 || sidecarInputs.empty())
+		return;
+	// About fifteen packets a second: each frame then goes out about eight
+	// times from each player.
+	if (++feedCalls % 4)
+		return;
+
+	unsigned last = std::min<unsigned>(feedConfirmed, sidecarInputs.size() - 1);
+	unsigned first = last + 1 > PLAYER_FEED_WINDOW ? last + 1 - PLAYER_FEED_WINDOW : 0;
+	unsigned count = last + 1 - first;
+	char buffer[sizeof(PacketPlayerFeed) + PLAYER_FEED_WINDOW * 8];
+	auto packet = reinterpret_cast<PacketPlayerFeed *>(buffer);
+
+	packet->type = PLAYER_FEED;
+	packet->seed = SokuLib::gameParams.randomSeed;
+	packet->firstFrame = first;
+	packet->count = count;
+	for (unsigned i = 0; i < count; i++) {
+		auto &e = sidecarInputs[first + i]; // P3, P4, P1, P2
+
+		packet->inputs[i * 4]     = e[2];
+		packet->inputs[i * 4 + 1] = e[3];
+		packet->inputs[i * 4 + 2] = e[0];
+		packet->inputs[i * 4 + 3] = e[1];
+	}
+
+	auto &net = SokuLib::getNetObject();
+
+	SokuLib::DLL::ws2_32.sendto(
+		net.netUdp.socket, buffer, sizeof(PacketPlayerFeed) + count * 8, 0,
+		(sockaddr *)&net.netUdp.opponent, sizeof(net.netUdp.opponent)
+	);
 }
 
 // Scratch shared by the two halves of ONE simulated frame. Written by Pre and

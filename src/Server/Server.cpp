@@ -172,6 +172,7 @@ static bool isHandledType(unsigned char type)
 	case CLIENT_GAME:
 	case PLAYER_JOIN_ACK:
 	case SPECTATOR_REQUEST:
+	case PLAYER_FEED:
 		return true;
 	default:
 		return type == PACKET_ROLLBACK_INPUT || type == PACKET_ROLLBACK_ESC;
@@ -347,6 +348,7 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 		packet.type != CHAIN &&
 		// Frame rate, and printed under SokuRoll's name for 0x11.
 		packet.type != SPECTATOR_REQUEST &&
+		packet.type != PLAYER_FEED &&
 		this->_logHandshakeOnce(client, packet, false)
 	) {
 		std::cout << "[" << client.ip.toString() << ":" << client.port << "<]: ";
@@ -370,6 +372,8 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 		return this->_handlePacket(client, packet.playerJoinAck, packetSize);
 	case SPECTATOR_REQUEST:
 		return this->_handlePacket(client, *reinterpret_cast<PacketSpectatorRequest *>(&packet), packetSize);
+	case PLAYER_FEED:
+		return this->_handlePacket(client, *reinterpret_cast<PacketPlayerFeed *>(&packet), packetSize);
 	default:
 		return;
 	}
@@ -1269,6 +1273,8 @@ void Server::_handlePacketGameMatchAck(Client &client)
 		game.matchId() = this->_state.matchId;
 		this->_send(client, &game, game.getSize());
 		this->_setState(client, LOADING);
+		if (!this->_broadcast && (!this->_feed.active || this->_feed.seed != this->_state.randomSeed))
+			this->_startLiveFeed(game);
 	}
 }
 
@@ -1681,6 +1687,67 @@ void Server::_sendReplayToSpectator(Client &client, SokuLib::GameReplayRequestEv
 	out[o++] = check & 0xFF;
 	out[2] = static_cast<uint8_t>(o - 3);
 	this->_sock.send(out, o, client.ip, client.port);
+}
+
+// A new match is being loaded: what spectators watch from now on. The match
+// packet is the players' own, under the feed's match id -- spectators number
+// matches by the feed, which never uses 0, the id a spectator that has not
+// seen a match yet asks with.
+void Server::_startLiveFeed(const PacketGameMatchEvent &game)
+{
+	auto bytes = reinterpret_cast<const uint8_t *>(&game);
+
+	this->_feed.matchId++;
+	if (this->_feed.matchId == 0)
+		this->_feed.matchId = 1;
+	this->_feed.active = true;
+	this->_feed.seed = this->_state.randomSeed;
+	this->_feed.matchPacket.assign(bytes, bytes + game.getSize());
+	this->_feed.matchPacket.back() = this->_feed.matchId;
+	this->_feed.frames.clear();
+	this->_feed.known.clear();
+	this->_feed.available = 0;
+	this->_feed.ended = false;
+	for (int i = 0; i < 4; i++) {
+		memset(this->_feed.names[i], 0, sizeof(this->_feed.names[i]));
+		if (this->_state.slots[i] && this->_state.slots[i]->client)
+			memcpy(this->_feed.names[i], this->_state.slots[i]->client->name, sizeof(this->_feed.names[i]) - 1);
+	}
+	std::cout << "Spectators can now watch match " << (int)this->_feed.matchId << " (seed " << std::hex
+		<< this->_feed.seed << std::dec << "), fed by the players." << std::endl;
+}
+
+void Server::_handlePacket(Client &client, PacketPlayerFeed &packet, size_t packetSize)
+{
+	if (packetSize < sizeof(packet) || packetSize < sizeof(packet) + packet.count * 8u)
+		return;
+	if (client.state == nullptr || this->_broadcast || !this->_feed.active || packet.seed != this->_feed.seed)
+		return;
+
+	size_t end = static_cast<size_t>(packet.firstFrame) + packet.count;
+
+	// A match is minutes long; anything far beyond that is not a frame number.
+	if (end > 60 * 60 * 30)
+		return;
+	if (this->_feed.frames.size() < end) {
+		this->_feed.frames.resize(end);
+		this->_feed.known.resize(end, false);
+	}
+	for (unsigned i = 0; i < packet.count; i++) {
+		size_t f = packet.firstFrame + i;
+
+		if (this->_feed.known[f])
+			continue;
+		memcpy(this->_feed.frames[f].data(), &packet.inputs[i * 4], 8);
+		this->_feed.known[f] = true;
+	}
+
+	size_t before = this->_feed.available;
+
+	while (this->_feed.available < this->_feed.known.size() && this->_feed.known[this->_feed.available])
+		this->_feed.available++;
+	if (before == 0 && this->_feed.available > 0)
+		std::cout << "Match " << (int)this->_feed.matchId << ": the players' input is reaching the relay." << std::endl;
 }
 
 void Server::_handlePacket(Client &client, PacketSpectatorRequest &packet, size_t packetSize)

@@ -32,6 +32,9 @@ enum CustomOpcodes : unsigned char {
 	// Spectator -> relay: which match it is watching and how many frames of it
 	// it holds. The relay answers with the next ones.
 	SPECTATOR_REQUEST,
+	// Player -> relay: final inputs of the match being played, for the
+	// relay's spectators. See PacketPlayerFeed.
+	PLAYER_FEED,
 };
 
 struct PacketPlayerJoin {
@@ -61,6 +64,22 @@ struct PacketSpectatorRequest {
 	uint8_t matchId;
 	uint32_t have;
 };
+
+// The last PLAYER_FEED_WINDOW final frames a player holds, from firstFrame on,
+// each four packed Inputs in P1..P4 order. A frame is final once giuroll has
+// every player's input for it and has simulated it with exactly those, so all
+// four players send the same words for it; each frame goes out in several
+// packets from each of them, which is all the loss recovery there is. `seed`
+// is the match's random seed, which the relay chose: it says which match.
+struct PacketPlayerFeed {
+	CustomOpcodes type;
+	uint32_t seed;
+	uint32_t firstFrame;
+	uint16_t count;
+	uint16_t inputs[0];
+};
+
+constexpr unsigned PLAYER_FEED_WINDOW = 32;
 
 struct PacketPlayerJoinAck {
 	CustomOpcodes type;

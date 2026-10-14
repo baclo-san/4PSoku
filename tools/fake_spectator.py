@@ -2,6 +2,8 @@
 
     python fake_spectator.py make <file.rep.4p>     write a synthetic version-4 replay
     python fake_spectator.py run <port>             talk to a relay on 127.0.0.1:<port>
+    python fake_spectator.py live <port>            four fake players feed a live match
+                                                    to a relay (no --broadcast); then watch it
 """
 import socket, struct, sys, time, zlib
 
@@ -89,5 +91,90 @@ def run(port):
     print("ALL OK")
 
 
+def recv_from(s, pred, what, timeout=3):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            d, _ = s.recvfrom(4096)
+        except socket.timeout:
+            continue
+        if pred(d):
+            return d
+    raise SystemExit("FAIL: no " + what)
+
+
+def live(port):
+    addr = ("127.0.0.1", port)
+    chars = [7, 1, 3, 9]
+    players = []
+    for i in range(4):
+        p = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        p.settimeout(0.2)
+        name = b"player%d" % (i + 1)
+        # The game sends its name field zero-padded to 32 bytes.
+        p.sendto(bytes([5]) + GAME_ID + bytes(8) + bytes([1, len(name)]) + name.ljust(32, bytes(1)), addr)
+        recv_from(p, lambda d: d[0] == 6, "INIT_SUCCESS for player %d" % (i + 1))
+        p.sendto(bytes([0x0A, i]), addr)  # PLAYER_JOIN_ACK: take slot i
+        recv_from(p, lambda d: d[0] == 0x0A and d[1] == i, "slot %d" % i)
+        players.append(p)
+    for i, p in enumerate(players):
+        deck = list(range(100, 120))
+        p.sendto(bytes([0x0F, chars[i], 5, 6, i, 0, 0, 20]) + struct.pack("<20H", *deck), addr)
+    seed = None
+    for i, p in enumerate(players):
+        p.sendto(bytes([0x0E, 5]), addr)  # GAME_MATCH_ACK
+        d = recv_from(p, lambda d: d[0] == 0x0D and d[1] == 4, "GAME_MATCH for player %d" % (i + 1))
+        off = 2
+        for _ in range(4):
+            off += 4 + 2 * d[off + 3] + 1
+        seed = struct.unpack_from("<I", d, off + 2)[0]
+    print("players in the match, seed %08x" % seed)
+
+    def feed(p, first, count):
+        body = b"".join(struct.pack("<4H", *(frame_input(f, k) for k in range(4))) for f in range(first, first + count))
+        p.sendto(bytes([0x12]) + struct.pack("<IIH", seed, first, count) + body, addr)
+
+    feed(players[0], 0, 32)
+    feed(players[1], 64, 32)   # a gap: 32..63 not yet in
+    feed(players[2], 16, 32)   # overlaps, fills 32..47
+    feed(players[3], 0, 5)
+    feed(players[0], 0, 8)     # wrong seed below must be ignored
+    players[0].sendto(bytes([0x12]) + struct.pack("<IIH", seed ^ 1, 48, 16) + bytes(16 * 8), addr)
+    time.sleep(0.3)
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.2)
+    s.sendto(bytes([5]) + GAME_ID + bytes(8) + bytes([0, 6]) + b"tester", addr)
+    d = recv_from(s, lambda d: d[0] == 6, "INIT_SUCCESS for the spectator")
+    assert d[5] & 1, "not flagged as a spectator"
+    names = [d[o:o + 32].split(bytes(1))[0] for o in (13, 45, 81, 113)]
+    print("spectator in, names", names)
+    assert names == [b"player1", b"player2", b"player3", b"player4"], names
+    s.sendto(bytes([0x0E, 0x0B]) + struct.pack("<IB", 0xFFFFFFFF, 0), addr)
+    d = recv_from(s, lambda d: d[0] == 0x0D and d[1] == 4, "GAME_MATCH for the spectator")
+    match = d[-1]
+    print("spectator got the match, id", match)
+    assert match != 0
+
+    s.sendto(bytes([0x11, match]) + struct.pack("<I", 0), addr)
+    d = recv_from(s, lambda d: d[0] == 0x10, "SPECTATOR_INPUTS")
+    m, first, count, ended = struct.unpack_from("<BIHB", d, 1)
+    print("SPECTATOR_INPUTS match", m, "first", first, "count", count, "(48 expected: 0..47, 48..63 missing)")
+    assert (m, first, count) == (match, 0, 48), (m, first, count)
+    vals = struct.unpack_from("<%dH" % (4 * count), d, 9)
+    for f in range(count):
+        for k in range(4):
+            assert vals[4 * f + k] == frame_input(f, k), (f, k)
+
+    feed(players[3], 40, 32)   # closes the gap
+    time.sleep(0.2)
+    s.sendto(bytes([0x11, match]) + struct.pack("<I", 48), addr)
+    d = recv_from(s, lambda d: d[0] == 0x10, "SPECTATOR_INPUTS after the gap")
+    m, first, count, ended = struct.unpack_from("<BIHB", d, 1)
+    print("after the gap closed: first", first, "count", count)
+    assert (first, count) == (48, 48), (first, count)
+    print("ALL OK")
+
+
 if __name__ == "__main__":
-    {"make": lambda: make(sys.argv[2]), "run": lambda: run(int(sys.argv[2]))}[sys.argv[1]]()
+    {"make": lambda: make(sys.argv[2]), "run": lambda: run(int(sys.argv[2])), "live": lambda: live(int(sys.argv[2]))}[sys.argv[1]]()
