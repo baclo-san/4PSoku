@@ -2388,6 +2388,55 @@ void __declspec(naked) healExtraChrs()
 
 static int (__thiscall *s_ogHudRender)(void *);
 
+// P3/P4's names in an online battle.
+//
+// The HUD draws the two names one of two ways (0x47D850..0x47DB95). Offline
+// it asks for profile 0/1, which the second-HUD pass below redirects to
+// profiles 2/3. Online it reads the NetObject (0x43E0C0): the name at +4 /
+// +0x24 for its length, then draws the name sprite at +0x284 / +0x318. That
+// path was never redirected, so the second pass drew P1/P2's names a second
+// time, underneath the first, and P3/P4 had none.
+//
+// So the online path's NetObject reads go through hudNetObject(): the real
+// one, except during the second pass, when it is this stand-in carrying P3/P4's
+// names and sprites at the same offsets. Byte copies, refreshed each time: the
+// sprites stay owned by extraNetProfileNames, and nothing here destructs them.
+static constexpr size_t GAME_SPRITE_SIZE = 0x94;
+static_assert(sizeof(SokuLib::Sprite) == GAME_SPRITE_SIZE);
+static struct {
+	char pad0[4];
+	char names[2][32];
+	char pad1[0x284 - 0x44];
+	alignas(4) unsigned char sprites[2][GAME_SPRITE_SIZE];
+} hudNetStandIn;
+static_assert(offsetof(decltype(hudNetStandIn), sprites) == 0x284);
+static bool hudNetUseStandIn = false;
+
+static void *__stdcall hudNetObjectImpl()
+{
+	void *real = *reinterpret_cast<void **>(0x8986A0);
+
+	if (!hudNetUseStandIn || !real)
+		return real;
+	memcpy(hudNetStandIn.names, extraOnlineNames, sizeof(hudNetStandIn.names));
+	memcpy(hudNetStandIn.sprites, extraNetProfileNames, sizeof(hudNetStandIn.sprites));
+	return &hudNetStandIn;
+}
+
+// Replaces `call 0x43E0C0` in the name code; that only sets EAX, so this
+// keeps every other register as it was.
+static void __declspec(naked) hudNetObject()
+{
+	__asm {
+		PUSH ECX
+		PUSH EDX
+		CALL hudNetObjectImpl
+		POP EDX
+		POP ECX
+		RET
+	}
+}
+
 const double yPos = 62;
 
 int __fastcall onHudRender(CInfoManager *This)
@@ -2423,7 +2472,14 @@ int __fastcall onHudRender(CInfoManager *This)
 		*(char *)0x47DB15 = 3;
 		*(char *)0x47DB4B = 3;
 		*(const double **)0x47DB57 = &yPos;
+		// The online path's two names, at the same height.
+		*(const double **)0x47D8EB = &yPos;
+		*(const double **)0x47DA96 = &yPos;
+		hudNetUseStandIn = true;
 		s_ogHudRender(&hud2);
+		hudNetUseStandIn = false;
+		*(double **)0x47D8EB = (double *)0x858EB8;
+		*(double **)0x47DA96 = (double *)0x858EB8;
 		*(char *)0x47D93F = 0;
 		*(char *)0x47D978 = 0;
 		*(char *)0x47D9A0 = 0;
@@ -4993,6 +5049,11 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	*(char *)0x4513A7 = 0xC;
 	*(char *)0x451650 = 0xC;
 	*(char *)0x4514DC = 0xC;
+
+	// The HUD's online name code reads the NetObject through these calls; see
+	// hudNetObject.
+	for (DWORD addr : {0x47D85D, 0x47D86A, 0x47D8AB, 0x47D8DD, 0x47DA04, 0x47DA11, 0x47DA56, 0x47DA88})
+		SokuLib::TamperNearCall(addr, hudNetObject);
 
 	og_switchBattleStateBreakAddr = (void *)SokuLib::TamperNearJmpOpr(0x481F58, healExtraChrs);
 	og_advanceFrame = SokuLib::TamperNearJmpOpr(0x48535D, checkWakeUp);
