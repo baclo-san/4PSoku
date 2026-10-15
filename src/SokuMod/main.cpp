@@ -1358,6 +1358,11 @@ static void __fastcall hostThroughRelay(char *menu)
 	if (!startHostRelay(port))
 		puts("4PSoku: could not start the relay, joining whatever is on that port; see 4psoku-relay.log");
 	setMenuString(menu + 0x42C, "127.0.0.1");
+	// The menu's update (0x4491DE) goes by its choice first: Host (1) to the
+	// host's handler, the four ways to connect (2-5) to 0x448A60, which then
+	// goes by substate. Both have to say "connecting to an IP", or the host's
+	// handler keeps running and nothing ever looks at the connection.
+	menu[8] = 2;
 	menu[9] = 3;
 	menu[0x3B8] = 1;
 	reinterpret_cast<void (__thiscall *)(void *, const char *)>(0x443900)(menu, reinterpret_cast<const char *>(0x8593F0));
