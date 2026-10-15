@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include "Server.hpp"
+#include "RelayLog.hpp"
 
 #define BUFFER_SIZE 1024
 // Frames of input delay in character select, where the relay runs strict
@@ -186,7 +187,7 @@ Server::Server(unsigned short port)
 	if (this->_sock.bind(port, sf::IpAddress::Any) != sf::Socket::Done)
 		throw std::runtime_error("Bind to port" + std::to_string(port) + " failed.");
 	this->_port = port;
-	std::cout << "Relay listening on UDP port " << port << " (all interfaces)." << std::endl;
+	relayLog() << "Relay listening on UDP port " << port << " (all interfaces)." << std::endl;
 }
 
 void Server::update()
@@ -209,12 +210,13 @@ void Server::update()
 		this->_startedAt.getElapsedTime().asSeconds() >= 60
 	) {
 		this->_unreachableHinted = true;
-		std::cout
+		relayLog()
 			<< "NOBODY FROM OUTSIDE HAS REACHED THIS RELAY in a minute -- only this machine. "
 			<< "Other players' packets are not arriving at all. Check, in this order:" << std::endl
-			<< "  1. Windows Firewall: allow 2v2Server.exe on PUBLIC and private networks "
+			<< "  1. Windows Firewall: allow the program running the relay -- th123.exe when hosting "
+			<< "from the game, 2v2Server.exe otherwise -- on PUBLIC and private networks "
 			<< "(Windows Security > Firewall > Allow an app, or delete its blocked entry and "
-			<< "restart the relay to get the prompt again). Allowing the game is not enough." << std::endl
+			<< "restart to get the prompt again)." << std::endl
 			<< "  2. The router forwards UDP port " << this->_port << " to this PC." << std::endl
 			<< "  3. The others connect to this PC's PUBLIC address and port " << this->_port << "." << std::endl;
 	}
@@ -271,7 +273,7 @@ void Server::update()
 
 				if (now - lastReport > std::chrono::seconds(5)) {
 					lastReport = now;
-					std::cout << "socket receive error " << WSAGetLastError() << " -- ignored, relay keeps running" << std::endl;
+					relayLog() << "socket receive error " << WSAGetLastError() << " -- ignored, relay keeps running" << std::endl;
 				}
 			}
 			return;
@@ -282,7 +284,7 @@ void Server::update()
 		auto it = this->_clients.find({ip, port});
 
 		if (it == this->_clients.end()) {
-			std::cout << "New connection from " << ip.toString() << ":" << port << std::endl;
+			relayLog() << "New connection from " << ip.toString() << ":" << port << std::endl;
 			if (ip.toString() != "127.0.0.1")
 				this->_remoteSeen = true;
 			this->_clients.emplace(std::pair{ip, port}, Client{ip, port});
@@ -316,7 +318,7 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 		auto &count = client.unhandled[packet.type];
 
 		if (count == 0)
-			std::cout << "[" << client.ip.toString() << ":" << client.port
+			relayLog() << "[" << client.ip.toString() << ":" << client.port
 				<< "<]: unhandled packet type " << (int)packet.type
 				<< " -- no handler here; further ones counted silently"
 				<< std::endl;
@@ -331,7 +333,7 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 	if ((unsigned char)packet.type == PACKET_ROLLBACK_ESC) {
 		if (client.state == nullptr || client.slotId < 0)
 			return;
-		std::cout << "\"" << client.name << "\" (slot " << (int)client.slotId
+		relayLog() << "\"" << client.name << "\" (slot " << (int)client.slotId
 			<< ") pressed Esc and left the match -- telling the other players" << std::endl;
 		for (auto &other : this->_clients) {
 			if (&other.second == &client)
@@ -351,9 +353,9 @@ void Server::_handlePacket(Client &client, CustomPacket &packet, size_t packetSi
 		packet.type != PLAYER_FEED &&
 		this->_logHandshakeOnce(client, packet, false)
 	) {
-		std::cout << "[" << client.ip.toString() << ":" << client.port << "<]: ";
-		displayPacketContent(std::cout, packet);
-		std::cout << std::endl;
+		relayLog() << "[" << client.ip.toString() << ":" << client.port << "<]: ";
+		displayPacketContent(relayLog(), packet);
+		relayLog() << std::endl;
 	}
 	switch (packet.type) {
 	case HELLO:
@@ -407,7 +409,7 @@ void Server::_handlePacket(Client &client, SokuLib::PacketInitRequ &packet, size
 	// 2026-09-26: an endless column of INIT_REQUEST and no reply. The game id
 	// check below is what actually guards the door; the HELLO adds nothing.
 	if (client.status == STATUS_CONNECTED) {
-		std::cout << client.ip.toString() << ":" << client.port
+		relayLog() << client.ip.toString() << ":" << client.port
 			<< " sent INIT_REQUEST without HELLO (relay restarted or lost it) -- accepting" << std::endl;
 		client.status = STATUS_POLITE;
 	}
@@ -416,7 +418,7 @@ void Server::_handlePacket(Client &client, SokuLib::PacketInitRequ &packet, size
 	if (memcmp(packet.gameId, versionString2v2, 16) != 0) {
 		if (!client.badGameIdReported) {
 			client.badGameIdReported = true;
-			std::cout
+			relayLog()
 				<< "REJECTED " << client.ip.toString() << ":" << client.port
 				<< " (\"" << packet.name << "\"): wrong game id -- "
 				<< describeGameId(packet.gameId) << std::endl;
@@ -834,7 +836,7 @@ void Server::_handleChrSelectInput(Server::Client &client, SokuLib::GameInputEve
 				this->_chrBlocker != nullptr
 			) {
 				this->_chrStallReport.restart();
-				std::cout
+				relayLog()
 					<< "CHARSELECT STALLED at frame " << this->_chrHistory.size() << ": \""
 					<< (this->_chrBlocker->client ? this->_chrBlocker->client->name : "<gone>")
 					<< "\" " << this->_chrBlockReason << std::endl;
@@ -875,7 +877,7 @@ void Server::_relayRollbackInput(Client &client, void *data, size_t size)
 		return;
 	if (!client.rollbackRelayReported) {
 		client.rollbackRelayReported = true;
-		std::cout
+		relayLog()
 			<< "relaying rollback input for \"" << client.name
 			<< "\" (slot " << (int)client.slotId
 			<< ") -- it reached the relay, so at least one of its peers is not "
@@ -945,7 +947,7 @@ void Server::_setState(PlayerState &state, GameStateStep to)
 {
 	if (state.state == to)
 		return;
-	std::cout
+	relayLog()
 		<< "state: \"" << (state.client ? state.client->name : "<gone>") << "\" "
 		<< stateName(state.state) << " -> " << stateName(to) << std::endl;
 	state.state = to;
@@ -1107,7 +1109,7 @@ void Server::_reportChrSelectStall(Client &client, SokuLib::GameInputEvent &pack
 	auto supplied = (long)slowest.lastFrameId - (long)slowest.frameIdOffset;
 	auto consumed = (long)packet.frameId - (long)client.state->frameIdOffset;
 
-	std::cout
+	relayLog()
 		<< "CHARSELECT STALLED: \"" << client.name << "\" sits at frame " << packet.frameId
 		<< " and will not be sent another until \""
 		<< (slowest.client ? slowest.client->name : "<gone>")
@@ -1119,26 +1121,26 @@ void Server::_reportChrSelectStall(Client &client, SokuLib::GameInputEvent &pack
 void Server::_reportChrSelectProgress(Client &client)
 {
 	if (client.chrSelectStalls >= 60)
-		std::cout
+		relayLog()
 			<< "CHARSELECT RECOVERED: \"" << client.name << "\" is moving again"
 			<< std::endl;
 	client.chrSelectStalls = 0;
 	if (this->_chrSelectReport.getElapsedTime().asMilliseconds() < 2000)
 		return;
 	this->_chrSelectReport.restart();
-	std::cout << "charselect frame " << this->_chrHistory.size() << ", acknowledged:";
+	relayLog() << "charselect frame " << this->_chrHistory.size() << ", acknowledged:";
 	for (int slot = 0; slot < 4; slot++) {
 		auto *player = this->_state.slots[slot];
 
-		std::cout << "  " << slot << ")";
+		relayLog() << "  " << slot << ")";
 		if (!player || !player->client)
-			std::cout << " empty";
+			relayLog() << " empty";
 		else
-			std::cout
+			relayLog()
 				<< " " << player->client->name
 				<< " f" << player->chrAck;
 	}
-	std::cout << std::endl;
+	relayLog() << std::endl;
 }
 
 // Reflect battle inputs; do not coordinate them.
@@ -1212,7 +1214,7 @@ void Server::_handleBattleInput(Server::Client &client, SokuLib::GameInputEvent 
 
 	if (!client.battleStreamReported) {
 		client.battleStreamReported = true;
-		std::cout
+		relayLog()
 			<< "battle input stream open for " << client.name
 			<< " (slot " << (int)client.slotId
 			<< "), answering its own frame " << packet.frameId
@@ -1285,7 +1287,7 @@ void Server::_handlePacketGame(Client &client, SokuLib::GameReplayRequestEvent &
 void Server::_onPlayerDisconnect(size_t index)
 {
 	assert(index < this->_state.players.size());
-	std::cout << "Removing player " << index << " because of disconnect." << std::endl;
+	relayLog() << "Removing player " << index << " because of disconnect." << std::endl;
 
 	auto victim = std::next(this->_state.players.begin(), index);
 	PacketPlayerJoin response{PLAYER_JOIN, {0}, victim->client->slotId};
@@ -1322,9 +1324,9 @@ void Server::_send(Server::Client &client, void *data, size_t size)
 		(unsigned char)packet.type != PACKET_ROLLBACK_INPUT &&
 		this->_logHandshakeOnce(client, packet, true)
 	) {
-		std::cout << "[" << client.ip.toString() << ":" << client.port << ">]: ";
-		displayPacketContent(std::cout, packet);
-		std::cout << std::endl;
+		relayLog() << "[" << client.ip.toString() << ":" << client.port << ">]: ";
+		displayPacketContent(relayLog(), packet);
+		relayLog() << std::endl;
 	}
 	this->_sock.send(data, size, client.ip, client.port);
 }
@@ -1382,7 +1384,7 @@ void Server::_sendPeerList(Server::Client &client)
 
 void Server::_disconnect(Server::Client &client)
 {
-	std::cout << client.ip.toString() << ":" << client.port << " disconnected." << std::endl;
+	relayLog() << client.ip.toString() << ":" << client.port << " disconnected." << std::endl;
 
 	// A socket that only ever said HELLO, from the same address as a player who
 	// got further. That is a second program speaking for the same machine --
@@ -1394,13 +1396,13 @@ void Server::_disconnect(Server::Client &client)
 	if (client.status == STATUS_POLITE)
 		for (auto &other : this->_clients)
 			if (&other.second != &client && other.second.ip == client.ip && other.second.status > STATUS_POLITE) {
-				std::cout << "    hint: " << client.ip.toString() << " had a second socket that only ever sent HELLO. "
+				relayLog() << "    hint: " << client.ip.toString() << " had a second socket that only ever sent HELLO. "
 					<< "If that player keeps getting thrown out of character select, have them "
 					<< "DISABLE AUTOPUNCH -- the relay already does its job." << std::endl;
 				break;
 			}
 	for (auto &pair : client.unhandled)
-		std::cout << "    sent " << pair.second << " packets of unhandled type "
+		relayLog() << "    sent " << pair.second << " packets of unhandled type "
 			<< (int)pair.first << " (a mod on their machine, not this protocol)"
 			<< std::endl;
 	client.status = STATUS_DISCONNECTED;
@@ -1531,11 +1533,11 @@ void Server::loadBroadcast(const std::string &path)
 	this->_feed.matchPacket = buildMatchPacket(players, setup.disabledSimul, setup.stage, setup.music, setup.seed, 1);
 	for (int i = 0; i < 4; i++)
 		snprintf(this->_feed.names[i], sizeof(this->_feed.names[i]), "Broadcast P%d", i + 1);
-	std::cout << "Broadcasting " << path << ": " << this->_feed.frames.size() << " frames ("
+	relayLog() << "Broadcasting " << path << ": " << this->_feed.frames.size() << " frames ("
 		<< this->_feed.frames.size() / 60 << " s), characters";
 	for (auto &p : players)
-		std::cout << " " << (int)p.character;
-	std::cout << ", stage " << (int)setup.stage << ". It starts when the first spectator connects, "
+		relayLog() << " " << (int)p.character;
+	relayLog() << ", stage " << (int)setup.stage << ". It starts when the first spectator connects, "
 		<< "and plays again as a new match 10 s after it ends. Players cannot join." << std::endl;
 }
 
@@ -1550,7 +1552,7 @@ void Server::_updateBroadcast()
 	this->_feed.available = std::min<size_t>(total, static_cast<size_t>(seconds * 60));
 	if (this->_feed.available == total && !this->_feed.ended) {
 		this->_feed.ended = true;
-		std::cout << "Broadcast of match " << (int)this->_feed.matchId << " finished." << std::endl;
+		relayLog() << "Broadcast of match " << (int)this->_feed.matchId << " finished." << std::endl;
 	}
 	if (this->_feed.ended && seconds * 60 > total + 600) {
 		this->_feed.matchId++;
@@ -1560,14 +1562,14 @@ void Server::_updateBroadcast()
 		this->_feed.ended = false;
 		this->_feed.matchPacket.back() = this->_feed.matchId;
 		this->_broadcastClock.restart();
-		std::cout << "Broadcasting it again as match " << (int)this->_feed.matchId << "." << std::endl;
+		relayLog() << "Broadcasting it again as match " << (int)this->_feed.matchId << "." << std::endl;
 	}
 }
 
 void Server::_handleSpectatorJoin(Client &client, SokuLib::PacketInitRequ &packet)
 {
 	if (!this->_feed.active) {
-		std::cout << client.ip.toString() << ":" << client.port << " (\"" << packet.name
+		relayLog() << client.ip.toString() << ":" << client.port << " (\"" << packet.name
 			<< "\") wants to spectate, but no match is being played." << std::endl;
 		return this->_send<SokuLib::PacketInitError>(client, SokuLib::INIT_ERROR, SokuLib::ERROR_GAME_STATE_INVALID);
 	}
@@ -1585,7 +1587,7 @@ void Server::_handleSpectatorJoin(Client &client, SokuLib::PacketInitRequ &packe
 	response.swrDisabled = 0;
 	this->_send(client, &response, sizeof(response));
 	if (client.status != STATUS_SPECTATING)
-		std::cout << "\"" << client.name << "\" is spectating." << std::endl;
+		relayLog() << "\"" << client.name << "\" is spectating." << std::endl;
 	client.status = STATUS_SPECTATING;
 	client.lastChainReceived.restart();
 	if (this->_broadcast && !this->_broadcastStarted) {
@@ -1610,7 +1612,7 @@ void Server::_handleSpectatorGame(Client &client, SokuLib::PacketGame &packet, s
 		// Counted like any other unexpected packet, so the first test of a
 		// spectator says what else it sends.
 		if (client.unhandled[0x80 | packet.event.type]++ == 0)
-			std::cout << "spectator \"" << client.name << "\" sent game event " << (int)packet.event.type
+			relayLog() << "spectator \"" << client.name << "\" sent game event " << (int)packet.event.type
 				<< " -- not handled" << std::endl;
 		return;
 	}
@@ -1633,7 +1635,7 @@ void Server::_sendReplayToSpectator(Client &client, SokuLib::GameReplayRequestEv
 		return this->_send(client, this->_feed.matchPacket.data(), this->_feed.matchPacket.size());
 	if (client.replayRequestMatch != packet.matchId) {
 		client.replayRequestMatch = packet.matchId;
-		std::cout << "spectator \"" << client.name << "\" loaded match " << (int)packet.matchId
+		relayLog() << "spectator \"" << client.name << "\" loaded match " << (int)packet.matchId
 			<< " and asks for the game's own input from entry " << packet.frameId << std::endl;
 	}
 
@@ -1713,7 +1715,7 @@ void Server::_startLiveFeed(const PacketGameMatchEvent &game)
 		if (this->_state.slots[i] && this->_state.slots[i]->client)
 			memcpy(this->_feed.names[i], this->_state.slots[i]->client->name, sizeof(this->_feed.names[i]) - 1);
 	}
-	std::cout << "Spectators can now watch match " << (int)this->_feed.matchId << " (seed " << std::hex
+	relayLog() << "Spectators can now watch match " << (int)this->_feed.matchId << " (seed " << std::hex
 		<< this->_feed.seed << std::dec << "), fed by the players." << std::endl;
 }
 
@@ -1747,7 +1749,7 @@ void Server::_handlePacket(Client &client, PacketPlayerFeed &packet, size_t pack
 	while (this->_feed.available < this->_feed.known.size() && this->_feed.known[this->_feed.available])
 		this->_feed.available++;
 	if (before == 0 && this->_feed.available > 0)
-		std::cout << "Match " << (int)this->_feed.matchId << ": the players' input is reaching the relay." << std::endl;
+		relayLog() << "Match " << (int)this->_feed.matchId << ": the players' input is reaching the relay." << std::endl;
 }
 
 void Server::_handlePacket(Client &client, PacketSpectatorRequest &packet, size_t packetSize)
@@ -1758,7 +1760,7 @@ void Server::_handlePacket(Client &client, PacketSpectatorRequest &packet, size_
 	// it asks at all and for which match.
 	if (client.spectatorRequestMatch != packet.matchId) {
 		client.spectatorRequestMatch = packet.matchId;
-		std::cout << "spectator \"" << client.name << "\" asks for the 4P input of match " << (int)packet.matchId
+		relayLog() << "spectator \"" << client.name << "\" asks for the 4P input of match " << (int)packet.matchId
 			<< " from frame " << packet.have << "; the relay is on match " << (int)this->_feed.matchId
 			<< " with " << this->_feed.available << " frames released" << std::endl;
 	}

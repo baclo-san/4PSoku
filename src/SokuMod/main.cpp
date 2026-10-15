@@ -18,6 +18,7 @@
 #include <intrin.h>
 #include "CustomPackets.hpp"
 #include "Replay4P.hpp"
+#include "HostRelay.hpp"
 
 #ifndef _DEBUG
 #define puts(...)
@@ -1155,18 +1156,19 @@ static void warnIfGiurollTooOld()
 	if (SokuLib::mainMode != SokuLib::BATTLE_MODE_VSSERVER && SokuLib::mainMode != SokuLib::BATTLE_MODE_VSCLIENT)
 		return;
 
-	HMODULE giuroll = GetModuleHandleA("giuroll.dll");
-
-	if (!giuroll || GetProcAddress(giuroll, "GiurollSavesFourPlayerState"))
+	// giuroll for 4P is giuroll4p.dll (giuroll-4p). A giuroll.dll is either
+	// upstream giuroll, which knows nothing of four players, or one of our
+	// builds from before the rename -- wrong either way.
+	if (GetModuleHandleA("giuroll4p.dll") || !GetModuleHandleA("giuroll.dll"))
 		return;
 	warned = true;
-	puts("4PSoku: giuroll.dll is too old for this 4PSoku -- 2v2 netplay will desync.");
+	puts("4PSoku: giuroll.dll is loaded instead of giuroll-4p -- 2v2 netplay will desync.");
 	CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
 		MessageBoxA(
 			nullptr,
-			"Your giuroll.dll is older than this 4PSoku.\n\n"
-			"The match will play, but it will desync the first time a player is healed.\n"
-			"Update giuroll.dll from the same release page as 4PSoku.",
+			"You are running giuroll.dll, not giuroll-4p (giuroll4p.dll).\n\n"
+			"The match will play, but it will desync.\n"
+			"Install giuroll-4p from the 4PSoku release page and remove giuroll from your mods.",
 			"4PSoku",
 			MB_ICONWARNING
 		);
@@ -1324,6 +1326,42 @@ int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *This)
 	aimCamera(This);
 	sendSpectatorFeed();
 	return ret;
+}
+
+// --- Hosting from the game ---------------------------------------------------
+//
+// The network menu's Host (its one call to 0x446A40, at 0x446E49) would make
+// this game the host of a vanilla 1v1. 4P matches go through the relay
+// instead, with every player its client, so Host now starts the relay inside
+// this game on the chosen port (HostRelay.cpp) and then has the menu join it
+// at 127.0.0.1 -- exactly what the game does for "connect to IP" (0x448ADF:
+// substate 3, play rather than watch, "connecting" message, 0x446B20).
+static void setMenuString(char *str, const char *value)
+{
+	// The menu's IP: a VC9 std::string at +0x42C. Text inline at +4 while
+	// the capacity at +0x18 is under 16, else through the pointer there; the
+	// length at +0x14. The value is short enough for either.
+	size_t len = strlen(value);
+	char *text = *reinterpret_cast<unsigned *>(str + 0x18) >= 16 ? *reinterpret_cast<char **>(str + 4) : str + 4;
+
+	memcpy(text, value, len + 1);
+	*reinterpret_cast<size_t *>(str + 0x14) = len;
+}
+
+static void __fastcall hostThroughRelay(char *menu)
+{
+	unsigned short port = *reinterpret_cast<unsigned short *>(menu + 0x428);
+
+	// A port that cannot be bound is most likely a relay already running on
+	// it -- 2v2Server.exe, say -- so it is joined all the same. If it is
+	// something else, the join times out with the game's own message.
+	if (!startHostRelay(port))
+		puts("4PSoku: could not start the relay, joining whatever is on that port; see 4psoku-relay.log");
+	setMenuString(menu + 0x42C, "127.0.0.1");
+	menu[9] = 3;
+	menu[0x3B8] = 1;
+	reinterpret_cast<void (__thiscall *)(void *, const char *)>(0x443900)(menu, reinterpret_cast<const char *>(0x8593F0));
+	reinterpret_cast<void (__thiscall *)(void *)>(0x446B20)(menu);
 }
 
 // --- Spectating -------------------------------------------------------------
@@ -5718,6 +5756,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	*(DWORD *)0x41E028 = 0x41DFC2;
 	*(void **)0x41E02C = handleSpectatorInputsPacket_hook;
 	SokuLib::TamperNearCall(0x455012, onSpectatorGameReplay);
+	SokuLib::TamperNearCall(0x446E49, hostThroughRelay);
 	static_assert(SPECTATOR_INPUTS == 16);
 
 	new SokuLib::Trampoline(0x428789, sendCurrentSelectCharacter, 5);

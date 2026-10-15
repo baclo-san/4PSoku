@@ -29,17 +29,23 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC" OR ("${CMAKE_CXX_COMPILER_ID}" ST
 		"${PROJECT_NAME}"
 		MODULE
 		src/SokuMod/main.cpp
+		src/SokuMod/HostRelay.cpp
 		src/SokuMod/version.rc
 		src/Common/CustomPackets.hpp
 		src/Common/CustomPackets.cpp
+		# The relay, for hosting from the game; also built as 2v2Server.exe.
+		src/Server/Server.cpp
 	)
 	target_compile_options("${PROJECT_NAME}" PRIVATE /Zi)
-	target_compile_definitions("${PROJECT_NAME}" PRIVATE DIRECTINPUT_VERSION=0x0800 CURL_STATICLIB _CRT_SECURE_NO_WARNINGS $<$<CONFIG:Debug>:_DEBUG>)
+	# USE_MININET: the relay inside the game uses MiniNet's sockets, never SFML.
+	target_compile_definitions("${PROJECT_NAME}" PRIVATE DIRECTINPUT_VERSION=0x0800 CURL_STATICLIB _CRT_SECURE_NO_WARNINGS USE_MININET $<$<CONFIG:Debug>:_DEBUG>)
 	target_include_directories("${PROJECT_NAME}" PRIVATE include SokuLib/directx src/Common/)
 	target_link_directories("${PROJECT_NAME}" PRIVATE lib)
 	target_link_libraries(
 		"${PROJECT_NAME}"
 		SokuLib
+		ws2_32
+		winmm
 		shlwapi
 		d3d9
 		d3dx9

@@ -19,46 +19,6 @@
 // to a freeze that happened while a slot-ack loop was scrolling it away. A
 // file keeps the whole session, and the timestamps turn "it froze" into
 // "nothing went to that player for 1.8 seconds after 23:10:41.200".
-class TeeBuf : public std::streambuf {
-public:
-	TeeBuf(std::streambuf *console, std::streambuf *file) : _console(console), _file(file) {}
-
-protected:
-	int overflow(int c) override
-	{
-		if (c == EOF)
-			return 0;
-		if (this->_lineStart) {
-			SYSTEMTIME t;
-			char stamp[32];
-
-			GetLocalTime(&t);
-			int n = snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
-			this->_console->sputn(stamp, n);
-			this->_file->sputn(stamp, n);
-			this->_lineStart = false;
-		}
-		this->_console->sputc((char)c);
-		this->_file->sputc((char)c);
-		if (c == '\n')
-			this->_lineStart = true;
-		return c;
-	}
-
-	// std::endl lands here, so each finished line reaches the disk: a relay
-	// that is killed or crashes still leaves everything up to its last line.
-	int sync() override
-	{
-		this->_console->pubsync();
-		this->_file->pubsync();
-		return 0;
-	}
-
-private:
-	std::streambuf *_console;
-	std::streambuf *_file;
-	bool _lineStart = true;
-};
 
 static std::string logPathNextToExe()
 {
@@ -77,6 +37,13 @@ static std::string logPathNextToExe()
 #include <cstdint>
 #include <thread>
 #include "Server.hpp"
+#include "RelayLog.hpp"
+
+// The exe logs to its console, which main() tees into a file next to it.
+std::ostream &relayLog()
+{
+	return std::cout;
+}
 
 namespace SokuLib {
 	std::vector<std::string> charactersName{
@@ -144,7 +111,7 @@ int main(int argc, char **argv)
 	// unread for a full tick. In character select's lockstep that is added to
 	// every input. timeBeginPeriod(1) below makes 1 ms mean 1 ms.
 	static std::ofstream logFile{logPathNextToExe()};
-	static TeeBuf tee{std::cout.rdbuf(), logFile.rdbuf()};
+	static RelayLogBuf tee{std::cout.rdbuf(), logFile.rdbuf()};
 
 	if (logFile)
 		std::cout.rdbuf(&tee);
